@@ -25,7 +25,7 @@ struct le_backend_vk_settings_o {
 		VkPhysicalDeviceVulkan13Features                 vk_1_3;
 		VkPhysicalDeviceRayTracingPipelineFeaturesKHR    ray_tracing_pipeline;
 		VkPhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure;
-		VkPhysicalDeviceMeshShaderFeaturesNV             mesh_shader;
+		VkPhysicalDeviceMeshShaderFeaturesEXT            mesh_shader;
 	} physical_device_features;
 
 	std::vector<VkQueueFlags> requested_queues_capabilities = {
@@ -353,9 +353,9 @@ static le_backend_vk_settings_o* le_backend_vk_settings_create() {
 	le_backend_vk_settings_add_required_device_extension( self, "VK_KHR_pipeline_library" );
 #endif
 
-#ifdef LE_FEATURE_MESH_SHADER_NV_DEPRECATED
+#ifdef LE_FEATURE_MESH_SHADER
 
-	self->physical_device_features.mesh_shader.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_NV;
+	self->physical_device_features.mesh_shader.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
 
 	auto mesh_shader_features = get_or_append_features_chain_link( features_chain, &self->physical_device_features.mesh_shader );
 
@@ -367,6 +367,8 @@ static le_backend_vk_settings_o* le_backend_vk_settings_create() {
 
 	vk_12_features->shaderInt8    = VK_TRUE;
 	vk_12_features->shaderFloat16 = VK_TRUE;
+
+	le_backend_vk_settings_add_required_device_extension( self, VK_EXT_MESH_SHADER_EXTENSION_NAME );
 #endif
 
 	return self;

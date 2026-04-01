@@ -13,6 +13,7 @@ depends_on_island_module(le_tracy)
 
 add_compile_definitions(SPIRV_REFLECT_USE_SYSTEM_SPIRV_H)
 add_compile_definitions(VK_NO_PROTOTYPES)
+add_compile_definitions(LE_FEATURE_MESH_SHADER)
 
 
 set (SOURCES "le_backend_vk.cpp")
