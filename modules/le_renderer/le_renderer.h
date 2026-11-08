@@ -99,6 +99,7 @@ struct le_renderer_api {
 	};
 
 	typedef bool ( *pfn_renderpass_setup_t )( le_renderpass_o *obj, void* user_data );
+	typedef void ( *pfn_renderpass_cleanup_t )( void* user_data );
 	typedef void ( *pfn_renderpass_execute_t )( le_command_buffer_encoder_o *encoder, void *user_data );
 
 	struct renderpass_interface_t {
@@ -113,13 +114,15 @@ struct le_renderer_api {
 		le_renderpass_o *               ( *clone                )( const le_renderpass_o *obj );
         void                            ( *set_setup_callback   )( le_renderpass_o *obj, void *user_data, pfn_renderpass_setup_t setup_fun );
 		bool                            ( *has_setup_callback   )( const le_renderpass_o* obj);
+        void                            ( *set_cleanup_callback   )( le_renderpass_o *obj, void *user_data, pfn_renderpass_cleanup_t setup_fun );
 		void                            ( *add_color_attachment )( le_renderpass_o *obj, le_image_resource_handle resource_id, le_image_attachment_info_t const *info );
 		void                            ( *add_depth_stencil_attachment )( le_renderpass_o *obj, le_image_resource_handle resource_id, le_image_attachment_info_t const *info );
 		void                            ( *set_width            )( le_renderpass_o* obj, uint32_t width);
 		void                            ( *set_height           )( le_renderpass_o* obj, uint32_t height);
 		void                            ( *set_sample_count     ) (le_renderpass_o* obj, le::SampleCountFlagBits const & sampleCount);
 		bool                            ( *get_framebuffer_settings)(le_renderpass_o const * obj, uint32_t* width, uint32_t* height, le::SampleCountFlagBits* sample_count);
-		void                            ( *set_execute_callback )( le_renderpass_o *obj, void *user_data, pfn_renderpass_execute_t render_fun );
+		void                            ( *set_execute_callback )( le_renderpass_o *obj, void *user_data, pfn_renderpass_execute_t render_fun);
+		void                            ( *set_execute_callback_with_local_user_data )( le_renderpass_o *obj, void *user_data,  size_t user_data_num_bytes , pfn_renderpass_execute_t render_fun);
 		bool                            ( *has_execute_callback )( const le_renderpass_o* obj);
 		void                            ( *set_is_root          )( le_renderpass_o *obj, bool is_root );
 		bool                            ( *get_is_root          )( const le_renderpass_o *obj);
@@ -156,6 +159,7 @@ struct le_renderer_api {
 		void                 ( *add_renderpass   ) ( le_rendergraph_o *self, le_renderpass_o *rp );
 		void                 ( *group_pass_with  ) ( le_rendergraph_o *self, le_renderpass_o const *child, le_renderpass_o const * parent );
 		void                 ( *declare_resource ) ( le_rendergraph_o *self, le_resource_handle const & resource_id, le_resource_info_t const & info);
+		le_renderpass_o *    ( *get_last_renderpass) (le_rendergraph_o * self);
 		void  				 ( *add_on_frame_clear_callbacks )( le_rendergraph_o* self, le_on_frame_clear_callback_data_t* callbacks, uint32_t callbacks_count );
 	};
 
@@ -181,6 +185,10 @@ struct le_renderer_api {
 
 		le_pipeline_manager_o*		 ( *get_pipeline_manager   )( le_command_buffer_encoder_o *self);
 		void                         ( *get_encoded_data       )( le_command_buffer_encoder_o *self, void **data, size_t *numBytes, size_t *numCommands );
+	
+		// insert a debug message into the command stream - message gets processed in the backend when command buffer is processed.
+        void                         ( *insert_debug_message   )( le_command_buffer_encoder_o* self, char const *message, uint64_t numBytes, uint32_t priority);
+		
 	};
 
 	struct command_buffer_graphics_encoder_interface_t{

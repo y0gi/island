@@ -989,8 +989,6 @@ static void shader_module_update_reflection( le_shader_module_o* module ) {
 
 			//			assert( info.count > 0 );
 
-			// TODO: we might need to detect that a binding is used for bindless ...
-
 			// Dynamic uniform buffers need to specify a range given in bytes.
 			if ( info.type == le::DescriptorType::eUniformBufferDynamic ) {
 				info.range = binding->block.size;
@@ -1010,7 +1008,6 @@ static void shader_module_update_reflection( le_shader_module_o* module ) {
 				 *
 				 */
 
-				// TODO: we could set a flag instead of just a boolean to tell us what type of descriptor this refers to
 				switch ( info.type ) {
 				case le::DescriptorType::eSampler:
 					info.is_bindless_resource = uint32_t( le_bindless_resource_type::eSampler );
@@ -1595,7 +1592,7 @@ static VkPipelineLayout le_pipeline_manager_get_pipeline_layout( le_pipeline_man
 // ----------------------------------------------------------------------
 // Creates a vulkan graphics pipeline based on a shader state object and a given renderpass and subpass index.
 //
-static VkPipeline le_pipeline_cache_create_graphics_pipeline( le_pipeline_manager_o* self, graphics_pipeline_state_o const* pso, const BackendRenderPass& pass, uint32_t subpass ) {
+static VkPipeline le_pipeline_cache_create_graphics_pipeline( le_pipeline_manager_o* self, graphics_pipeline_state_o const* pso, const BackendRenderPass& pass ) {
 
 	std::vector<VkPipelineShaderStageCreateInfo> pipelineStages;
 	pipelineStages.reserve( pso->shaderModules.size() );
@@ -1709,28 +1706,34 @@ static VkPipeline le_pipeline_cache_create_graphics_pipeline( le_pipeline_manage
 
 	//
 	// We must match blend attachment states with number of attachments for
-	// the current renderpass - each attachment may have their own blend state.
-	// Our pipeline objects will have 16 stages which are readable.
+	// the current renderpass. If blend attachment states are not defined,
+	// then we should use default blend attachment state for these states.
 	//
-	assert( pass.numColorAttachments <= LE_MAX_COLOR_ATTACHMENTS );
-	//
-	VkPipelineColorBlendStateCreateInfo colorBlendState =
-	    {
-	        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-	        .pNext           = nullptr,
-	        .flags           = 0,
-	        .logicOpEnable   = VK_FALSE,
-	        .logicOp         = VK_LOGIC_OP_CLEAR,
-	        .attachmentCount = pass.numColorAttachments,
-	        .pAttachments    = pso->data.blendAttachmentStates,
-	        .blendConstants  = {
-                pso->data.blend_factor_constants[ 0 ],
-                pso->data.blend_factor_constants[ 1 ],
-                pso->data.blend_factor_constants[ 2 ],
-                pso->data.blend_factor_constants[ 3 ],
-            },
-	    };
-	;
+
+	std::vector<VkPipelineColorBlendAttachmentState> blend_attachment_states;
+	blend_attachment_states.reserve( pass.numColorAttachments );
+	// insert states that are set via the pipeline directly
+	blend_attachment_states.insert( blend_attachment_states.end(), pso->data.blendAttachmentStates.begin(), pso->data.blendAttachmentStates.end() );
+	// fill unset states with default value for blend attachment state (alpha blending)
+	blend_attachment_states.insert(
+	    blend_attachment_states.end(), pass.numColorAttachments - blend_attachment_states.size(),
+	    LE_DEFAULT_COLOR_BLEND_ATTACHMENT_STATE );
+
+	VkPipelineColorBlendStateCreateInfo color_blend_state_info = {
+	    .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+	    .pNext           = nullptr,
+	    .flags           = 0,
+	    .logicOpEnable   = VK_FALSE,
+	    .logicOp         = VK_LOGIC_OP_CLEAR,
+	    .attachmentCount = pass.numColorAttachments,
+	    .pAttachments    = blend_attachment_states.data(), // fill in default for unset elements: this can be stack allocated.
+	    .blendConstants  = {
+            pso->data.blend_factor_constants[ 0 ],
+            pso->data.blend_factor_constants[ 1 ],
+            pso->data.blend_factor_constants[ 2 ],
+            pso->data.blend_factor_constants[ 3 ],
+        },
+	};
 
 	// Viewport and Scissor are tracked as dynamic states, and although this object will not
 	// get used, we must still fulfill the contract of providing a valid object to vk.
@@ -1768,12 +1771,22 @@ static VkPipeline le_pipeline_cache_create_graphics_pipeline( le_pipeline_manage
 
 	multisampleCreateInfo.rasterizationSamples = VkSampleCountFlagBits( pass.sampleCount );
 
+	VkPipelineRenderingCreateInfo pipeline_rendering_create_info = {
+	    .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, // VkStructureType
+	    .pNext                   = nullptr,                                          // void *, optional
+	    .viewMask                = pass.viewMask,                                    // uint32_t
+	    .colorAttachmentCount    = uint32_t( pass.color_formats.size() ),            // uint32_t, optional
+	    .pColorAttachmentFormats = ( VkFormat* )pass.color_formats.data(),           // VkFormat const *
+	    .depthAttachmentFormat   = VkFormat( pass.depth_format ),                    // VkFormat
+	    .stencilAttachmentFormat = VK_FORMAT_UNDEFINED,                              // VkFormat : TODO: we don't use a stencil format for now
+	};
+
 	// setup pipeline
 
 	VkGraphicsPipelineCreateInfo gpi =
 	    {
 	        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-	        .pNext               = nullptr,                                  //
+	        .pNext               = &pipeline_rendering_create_info,
 	        .flags               = VK_PIPELINE_CREATE_ALLOW_DERIVATIVES_BIT, //
 	        .stageCount          = uint32_t( pipelineStages.size() ),        // set shaders
 	        .pStages             = pipelineStages.data(),                    // set shaders
@@ -1784,13 +1797,13 @@ static VkPipeline le_pipeline_cache_create_graphics_pipeline( le_pipeline_manage
 	        .pRasterizationState = &pso->data.rasterizationInfo,             //
 	        .pMultisampleState   = &multisampleCreateInfo,                   // <- we patch this with correct sample count for renderpass, because otherwise not possible
 	        .pDepthStencilState  = &pso->data.depthStencilState,             //
-	        .pColorBlendState    = &colorBlendState,                         //
+	        .pColorBlendState    = &color_blend_state_info,                  //
 	        .pDynamicState       = &dynamicState,                            //
 	        .layout              = pipelineLayout,                           //
-	        .renderPass          = pass.renderPass,                          // must be a valid renderpass.
-	        .subpass             = subpass,                                  //
-	        .basePipelineHandle  = nullptr,                                  // optional
-	        .basePipelineIndex   = 0,                                        // -1 signals not to use a base pipeline index
+	        .renderPass          = nullptr,
+	        .subpass             = 0,
+	        .basePipelineHandle  = nullptr, // optional
+	        .basePipelineIndex   = 0,       // -1 signals not to use a base pipeline index
 	    };
 
 	VkPipeline pipeline = nullptr;
@@ -2321,7 +2334,7 @@ static inline void le_pipeline_manager_produce_pipeline_layout_info(
 static le_pipeline_and_layout_info_t le_pipeline_manager_produce_graphics_pipeline(
     le_pipeline_manager_o*   self,
     le_gpso_handle           gpso_handle,
-    const BackendRenderPass& pass, uint32_t subpass ) {
+    const BackendRenderPass& pass ) {
 
 	// TODO: Do we need this lock, or are the try_finds with their internal mutexes enough?
 	auto lock = std::unique_lock( self->mtx ); // Enforce sequentiality via scoped lock: no two renderpasses may access cache concurrently.
@@ -2347,6 +2360,28 @@ static le_pipeline_and_layout_info_t le_pipeline_manager_produce_graphics_pipeli
 	                                                  &pipeline_and_layout_info.layout_info, &pipeline_layout_hash );
 	// -- 2. get vk pipeline object
 	// we try to fetch it from the cache first, if it doesn't exist, we must create it, and add it to the cache.
+	uint64_t renderpass_hash = 0;
+
+	{
+		// Calculate hash over any parameters that make the character of a renderpass...
+		//
+		// - Format and order of attachments must match
+		// - multisample state must match.
+
+		struct pass_qualia_t {
+			le::Format              format;
+			le::SampleCountFlagBits numSamples;
+		};
+
+		std::vector<pass_qualia_t> pass_qualia;
+		pass_qualia.reserve( pass.attachments.size() );
+
+		for ( auto& a : pass.attachments ) {
+			pass_qualia.emplace_back( a.format, a.numSamples );
+		}
+
+		renderpass_hash = SpookyHash::Hash64( pass_qualia.data(), sizeof( pass_qualia_t ) * pass_qualia.size(), renderpass_hash );
+	}
 
 	uint64_t pipeline_hash = 0;
 	{
@@ -2356,7 +2391,7 @@ static le_pipeline_and_layout_info_t le_pipeline_manager_produce_graphics_pipeli
 		uint64_t pso_renderpass_hash_data_num_entries = 0;  // number of entries in pso_renderpass_hash_data
 
 		pso_renderpass_hash_data[ 0 ]        = reinterpret_cast<uint64_t>( gpso_handle ); // Hash associated with `pso`
-		pso_renderpass_hash_data[ 1 ]        = pass.renderpassHash;                       // Hash for *compatible* renderpass
+		pso_renderpass_hash_data[ 1 ]        = renderpass_hash;                           // Hash for *compatible* renderpass
 		pso_renderpass_hash_data_num_entries = 2;
 
 		for ( auto const& s : pso->shaderModules ) {
@@ -2377,7 +2412,7 @@ static le_pipeline_and_layout_info_t le_pipeline_manager_produce_graphics_pipeli
 		pipeline_and_layout_info.pipeline = *p;
 	} else {
 		// -- if not, create pipeline in pipeline cache and store / retain it
-		pipeline_and_layout_info.pipeline = le_pipeline_cache_create_graphics_pipeline( self, pso, pass, subpass );
+		pipeline_and_layout_info.pipeline = le_pipeline_cache_create_graphics_pipeline( self, pso, pass );
 		logger().info( "New VK Graphics Pipeline created: %p", pipeline_hash );
 		bool result = self->pipelines.try_insert( pipeline_hash, &pipeline_and_layout_info.pipeline );
 		assert( result && " pipeline insertion must be successful " );

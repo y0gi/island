@@ -11,6 +11,14 @@
 #include "glm/vec2.hpp"
 #include "glm/vec3.hpp"
 #include "glm/vec4.hpp"
+#include "le_log.h"
+
+#include <map>
+
+auto& logger() {
+	static le::Log l( "le_mesh_ply.cpp" );
+	return l;
+}
 
 #ifdef _WIN32
 #	define __PRETTY_FUNCTION__ __FUNCSIG__
@@ -29,8 +37,7 @@ static std::vector<char> load_file( const std::filesystem::path& file_path, bool
 	std::ifstream file( file_path, std::ios::in | std::ios::binary | std::ios::ate );
 
 	if ( !file.is_open() ) {
-		std::cerr << "Unable to open file: " << std::filesystem::canonical( file_path ) << std::endl
-		          << std::flush;
+		logger().error( "Unable to open file: '%s'", std::filesystem::canonical( file_path ).string().c_str() );
 		*success = false;
 		return contents;
 	}
@@ -71,14 +78,14 @@ static inline int does_start_with( char const* haystack, char const* needle, siz
 /// \brief loads mesh from ply file
 /// \note any contents of mesh will be cleared before loading
 /// \return true upon success, false otherwise.
-static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ ) {
+static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_, bool should_interleave, le_renderer_o* optional_renderer ) {
 
 	// - Make sure file exists
 
 	std::filesystem::path file_path{ file_path_ };
 
 	if ( !std::filesystem::exists( file_path ) ) {
-		std::cerr << "File not found: '" << file_path << "'";
+		logger().error( "File not found: '%s'", file_path.string().c_str() );
 		return false;
 	}
 
@@ -147,7 +154,7 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 	std::vector<char> file_data         = load_file( file_path, &file_load_success );
 
 	if ( !file_load_success ) {
-		std::cerr << "File could not be loaded: '" << file_path << "'";
+		logger().warn( "File could not be loaded: '%s'", file_path.string().c_str() );
 		return false;
 	}
 
@@ -159,14 +166,14 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 	char* c = strtok_r( file_data.data(), DELIMS, &c_save_ptr );
 
 	if ( 0 != strcmp( c, "ply" ) ) {
-		std::cerr << "Invalid file header: '" << file_path << "'";
+		logger().warn( "Invalid file header: '%s'", file_path.string().c_str() );
 		return false;
 	}
 
 	c = strtok_r( nullptr, DELIMS, &c_save_ptr );
 
 	if ( 0 != strcmp( c, "format ascii 1.0" ) ) {
-		std::cerr << "Invalid file header: '" << file_path << "'";
+		logger().warn( "Invalid file header: '%s'", file_path.string().c_str() );
 		return false;
 	}
 
@@ -242,8 +249,7 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 						property.list_size_type = Property::Type::eUint;
 						c += last_search_string_len + 1;
 					} else {
-						std::cerr << "Unknown list size type: '" << c << "'" << std::endl
-						          << std::flush;
+						logger().error( "Unknown list size type: '%s'", c );
 						assert( false );
 					}
 
@@ -256,8 +262,7 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 						property.list_content_type = Property::Type::eUint;
 						c += last_search_string_len + 1;
 					} else {
-						std::cerr << "Unknown list content type: '" << c << "'" << std::endl
-						          << std::flush;
+						logger().error( "Unknown list content type: '%s'", c );
 						assert( false );
 					}
 
@@ -278,8 +283,7 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 						property.type = Property::Type::eUchar;
 					} else {
 						// Unknown property type.
-						std::cerr << __PRETTY_FUNCTION__ << ": Unknown property type: " << c << std::endl
-						          << std::flush;
+						logger().error( ": Unknown property type: %s", c );
 						assert( false );
 						return false;
 					}
@@ -319,14 +323,12 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 					            0 == strncmp( c, "a", property.name_len ) ) {
 						property.attribute_type = Property::AttributeType::eColA;
 					} else {
-						std::cerr << "WARNING: Attribute name not recognised: '" << c << "'" << std::endl
-						          << std::flush;
+						logger().warn( "Attribute name not recognised: '%s'", c );
 					}
 
 					return true;
 				}
-				std::cerr << "Expected property type must be either 'list', or one of non-list type: uchar, float, uint, but given: " << c << std::endl
-				          << std::flush;
+				logger().error( "Expected property type must be either 'list', or one of non-list type: uchar, float, uint, but given: %s", c );
 				assert( false );
 				return false;
 			};
@@ -351,8 +353,7 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 		// been triggered - this means that there is something wrong with
 		// the file. we must exit.
 
-		std::cerr << "ERROR: " << __PRETTY_FUNCTION__ << "Invalid file header data: '" << c << "'" << std::endl
-		          << std::flush;
+		logger().error( "Invalid file header data: '%s'", c );
 
 		assert( false );
 
@@ -365,15 +366,29 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 
 	size_t num_vertices = 0;
 
+	// --
+
 	// - Load file data
 
 	Element const* element_archetype     = elements.data();
 	auto const     element_archetype_end = elements.data() + elements.size();
 
+	auto skip_comments_or_empty_lines = [ & ]() {
+		// skip any comments and empty lines
+		size_t needle_len = 1;
+		if ( does_start_with( c, "#", needle_len ) ||
+		     does_start_with( c, "\n", needle_len ) ||
+		     does_start_with( c, "\r", needle_len ) ) {
+			c = strtok_r( nullptr, DELIMS, &c_save_ptr );
+		}
+	};
+
 	// What follows now is a list of elements, one element per line.
 	// elements have properties, which are separated by commas.
 
 	for ( ; element_archetype != element_archetype_end; element_archetype++ ) {
+
+		skip_comments_or_empty_lines();
 
 		// Check whether the current property is still part of the current element
 		// Otherwise move to the next element
@@ -389,14 +404,22 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 				num_vertices = element_archetype->num_elements;
 			}
 
-			glm::vec3*       pos_data         = nullptr;
-			glm::vec3 const* pos_data_end     = nullptr;
-			glm::vec3*       normals_data     = nullptr;
-			glm::vec3 const* normals_data_end = nullptr;
-			glm::vec2*       uvs_data         = nullptr;
-			glm::vec2 const* uvs_data_end     = nullptr;
-			glm::vec4*       colours_data     = nullptr;
-			glm::vec4 const* colours_data_end = nullptr;
+			std::map<le_mesh_attribute_name, le_mesh_attribute_info_t> attribute_infos;
+
+			size_t           per_vertex_stride = 0;
+			glm::vec3*       pos_data          = nullptr;
+			glm::vec3 const* pos_data_end      = nullptr;
+			glm::vec3*       normals_data      = nullptr;
+			glm::vec3 const* normals_data_end  = nullptr;
+			glm::vec2*       uvs_data          = nullptr;
+			glm::vec2 const* uvs_data_end      = nullptr;
+			glm::vec4*       colours_data      = nullptr;
+			glm::vec4 const* colours_data_end  = nullptr;
+
+			size_t pos_data_per_vertex_offset     = 0;
+			size_t normals_data_per_vertex_offset = 0;
+			size_t uvs_data_per_vertex_offset     = 0;
+			size_t colours_data_per_vertex_offset = 0;
 
 			for ( auto const& p : element_archetype->properties ) {
 
@@ -404,44 +427,131 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 				case ( Property::AttributeType::eVX ): // intentional fall-through
 				case ( Property::AttributeType::eVY ): // intentional fall-through
 				case ( Property::AttributeType::eVZ ): // intentional fall-through
-					if ( pos_data == nullptr ) {
-						pos_data     = ( glm::vec3* )le_mesh_api_i->le_mesh_i.allocate_attribute_data( self, le_mesh_api::attribute_name_t::ePosition, sizeof( glm::vec3 ) );
+				{
+					constexpr le_mesh_attribute_info_t attr_info = { .name = le_mesh_attribute_name::ePosition, .bytes_per_vertex = sizeof( glm::vec3 ) };
+					if ( should_interleave ) {
+						attribute_infos[ le_mesh_attribute_name::ePosition ] = attr_info;
+					} else if ( pos_data == nullptr ) {
+						pos_data     = ( glm::vec3* )le_mesh_api_i->le_mesh_i.allocate_vertex_data( self, &attr_info, 1, optional_renderer );
 						pos_data_end = pos_data + sizeof( glm::vec3 ) * num_vertices;
 					}
-					break;
+				} break;
 				case ( Property::AttributeType::eNX ): // intentional fall-through
 				case ( Property::AttributeType::eNY ): // intentional fall-through
 				case ( Property::AttributeType::eNZ ): // intentional fall-through
-					if ( normals_data == nullptr ) {
-						normals_data     = ( glm::vec3* )le_mesh_api_i->le_mesh_i.allocate_attribute_data( self, le_mesh_api::attribute_name_t::eNormal, sizeof( glm::vec3 ) );
+				{
+					constexpr le_mesh_attribute_info_t attr_info = { .name = le_mesh_attribute_name::eNormal, .bytes_per_vertex = sizeof( glm::vec3 ) };
+					if ( should_interleave ) {
+						attribute_infos[ le_mesh_attribute_name::eNormal ] = attr_info;
+					} else if ( normals_data == nullptr ) {
+						normals_data     = ( glm::vec3* )le_mesh_api_i->le_mesh_i.allocate_vertex_data( self, &attr_info, 1, optional_renderer );
 						normals_data_end = normals_data + sizeof( glm::vec3 ) * num_vertices;
 					}
-					break;
+				} break;
 				case ( Property::AttributeType::eColR ): // intentional fall-through
 				case ( Property::AttributeType::eColG ): // intentional fall-through
 				case ( Property::AttributeType::eColB ): // intentional fall-through
 				case ( Property::AttributeType::eColA ): // intentional fall-through
-					if ( colours_data == nullptr ) {
-						colours_data     = ( glm::vec4* )le_mesh_api_i->le_mesh_i.allocate_attribute_data( self, le_mesh_api::attribute_name_t::eColour, sizeof( glm::vec4 ) );
+				{
+					constexpr le_mesh_attribute_info_t attr_info = { .name = le_mesh_attribute_name::eColour, .bytes_per_vertex = sizeof( glm::vec4 ) };
+					if ( should_interleave ) {
+						attribute_infos[ le_mesh_attribute_name::eColour ] = attr_info;
+					} else if ( colours_data == nullptr ) {
+						colours_data     = ( glm::vec4* )le_mesh_api_i->le_mesh_i.allocate_vertex_data( self, &attr_info, 1, optional_renderer );
 						colours_data_end = colours_data + sizeof( glm::vec4 ) * num_vertices;
 					}
-					break;
+				} break;
 				case ( Property::AttributeType::eTexU ): // intentional fall-through
 				case ( Property::AttributeType::eTexV ): // intentional fall-through
-					if ( uvs_data == nullptr ) {
-						uvs_data     = ( glm::vec2* )le_mesh_api_i->le_mesh_i.allocate_attribute_data( self, le_mesh_api::attribute_name_t::eUv, sizeof( glm::vec2 ) );
+				{
+					constexpr le_mesh_attribute_info_t attr_info = { .name = le_mesh_attribute_name::eUv, .bytes_per_vertex = sizeof( glm::vec2 ) };
+					if ( should_interleave ) {
+						attribute_infos[ le_mesh_attribute_name::eUv ] = attr_info;
+					} else if ( uvs_data == nullptr ) {
+						uvs_data     = ( glm::vec2* )le_mesh_api_i->le_mesh_i.allocate_vertex_data( self, &attr_info, 1, optional_renderer );
 						uvs_data_end = uvs_data + sizeof( glm::vec2 ) * num_vertices;
 					}
-					break;
+				} break;
 				case ( Property::AttributeType::eUnknown ):
 					break;
 				}
 				// TODO: check for tangents.
 			}
 
+			if ( should_interleave ) {
+
+				std::vector<le_mesh_attribute_info_t> attribute_info_vec;
+
+				for ( auto& [ key, item ] : attribute_infos ) {
+					attribute_info_vec.push_back( item );
+
+					switch ( key ) {
+					case le_mesh_attribute_name::eUndefined:
+						break;
+					case le_mesh_attribute_name::ePosition:
+						pos_data_per_vertex_offset = per_vertex_stride;
+						break;
+					case le_mesh_attribute_name::eNormal:
+						normals_data_per_vertex_offset = per_vertex_stride;
+						break;
+					case le_mesh_attribute_name::eColour:
+						colours_data_per_vertex_offset = per_vertex_stride;
+						break;
+					case le_mesh_attribute_name::eUv:
+						uvs_data_per_vertex_offset = per_vertex_stride;
+						break;
+					case le_mesh_attribute_name::eTangent:
+						assert( false && "tangent import not yet implemented" );
+						break;
+					default:
+						break;
+					}
+
+					per_vertex_stride += item.bytes_per_vertex;
+				}
+
+				void* data = le_mesh_api_i->le_mesh_i.allocate_vertex_data( self, attribute_info_vec.data(), attribute_info_vec.size(), optional_renderer );
+
+				for ( auto const& info : attribute_info_vec ) {
+
+					switch ( info.name ) {
+					case le_mesh_attribute_name::eUndefined:
+						break;
+					case le_mesh_attribute_name::ePosition:
+						pos_data     = ( glm::vec3* )( ( uint8_t* )( data ) + pos_data_per_vertex_offset );
+						pos_data_end = ( glm::vec3* )( ( uint8_t* )( data ) + pos_data_per_vertex_offset + per_vertex_stride * num_vertices );
+						break;
+					case le_mesh_attribute_name::eNormal:
+						normals_data     = ( glm::vec3* )( ( uint8_t* )( data ) + normals_data_per_vertex_offset );
+						normals_data_end = ( glm::vec3* )( ( uint8_t* )( data ) + normals_data_per_vertex_offset + per_vertex_stride * num_vertices );
+						break;
+					case le_mesh_attribute_name::eColour:
+						colours_data     = ( glm::vec4* )( ( uint8_t* )( data ) + colours_data_per_vertex_offset );
+						colours_data_end = ( glm::vec4* )( ( uint8_t* )( data ) + colours_data_per_vertex_offset + per_vertex_stride * num_vertices );
+						break;
+					case le_mesh_attribute_name::eUv:
+						uvs_data     = ( glm::vec2* )( ( uint8_t* )( data ) + uvs_data_per_vertex_offset );
+						uvs_data_end = ( glm::vec2* )( ( uint8_t* )( data ) + uvs_data_per_vertex_offset + per_vertex_stride * num_vertices );
+						break;
+					case le_mesh_attribute_name::eTangent:
+						assert( false && "tangent import not yet implemented" );
+						break;
+					default:
+						break;
+					}
+				}
+			}
+
 			size_t count_positions = 0;
 
 			for ( uint32_t i = 0; i != element_archetype->num_elements && c != nullptr; ++i, c = strtok_r( nullptr, DELIMS, &c_save_ptr ) ) {
+
+				if ( colours_data ) {
+					colours_data->w = 1.f; // initialize colour alpha to 1 in case it does not get set
+				}
+
+				skip_comments_or_empty_lines();
+
 				char* s = c;
 
 				if ( pos_data ) {
@@ -457,12 +567,12 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 					assert( colours_data < colours_data_end );
 				}
 
-				// clang-format off
 
 				for ( auto const& p : element_archetype->properties ) {
 
 					// todo: you need to iterate the archetype element
 
+					// clang-format off
 					switch ( p.attribute_type ) {
 					case ( Property::AttributeType::eVX )   : pos_data->x  = strtof( s, &s ); break;
 					case ( Property::AttributeType::eVY )   : pos_data->y  = strtof( s, &s ); break;
@@ -477,17 +587,25 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 					case ( Property::AttributeType::eColB ) : if ( colours_data ) { colours_data->z  = p.type == Property::Type::eFloat ? strtof( s, &s ) : strtoul( s, &s, 0 )/255.f; break; }
 					case ( Property::AttributeType::eColA ) : if ( colours_data ) { colours_data->w  = p.type == Property::Type::eFloat ? strtof( s, &s ) : strtoul( s, &s, 0 )/255.f; break; }
 					case ( Property::AttributeType::eUnknown ):
+						// clang-format on
 						// TODO: what do we do if there is an unknown attribute?
 						assert( false );
 						break;
 					}
 				}
 
-				pos_data     = pos_data     ? pos_data     + 1 : nullptr;
-				normals_data = normals_data ? normals_data + 1 : nullptr;
-				uvs_data     = uvs_data     ? uvs_data     + 1 : nullptr;
-				colours_data = colours_data ? colours_data + 1 : nullptr;
-
+				// clang-format off
+				if ( should_interleave ) {
+					pos_data     = pos_data     ? ( glm::vec3* )( ( uint8_t* )( pos_data     ) + per_vertex_stride ) : nullptr;
+					normals_data = normals_data ? ( glm::vec3* )( ( uint8_t* )( normals_data ) + per_vertex_stride ) : nullptr;
+					uvs_data     = uvs_data     ? ( glm::vec2* )( ( uint8_t* )( uvs_data     ) + per_vertex_stride ) : nullptr;
+					colours_data = colours_data ? ( glm::vec4* )( ( uint8_t* )( colours_data ) + per_vertex_stride ) : nullptr;
+				} else {
+					pos_data     = pos_data     ? pos_data     + 1 : nullptr;
+					normals_data = normals_data ? normals_data + 1 : nullptr;
+					uvs_data     = uvs_data     ? uvs_data     + 1 : nullptr;
+					colours_data = colours_data ? colours_data + 1 : nullptr;
+				}
 				// clang-format on
 			}
 
@@ -497,7 +615,7 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 
 			uint32_t num_bytes_per_index = sizeof( uint16_t ); // hint for 16bit indices, might be updated mesh-side if it detects that it has more than 65535 vertices.
 			size_t   num_indices         = element_archetype->num_elements * 3;
-			void*    index_data          = le_mesh::le_mesh_i.allocate_index_data( self, num_indices, &num_bytes_per_index );
+			void*    index_data          = le_mesh::le_mesh_i.allocate_index_data( self, num_indices, &num_bytes_per_index, nullptr );
 
 			// In case the mesh has more than 65535 vertices, index type will automatically have
 			// been assigned to be uint32_t, in which case the bytes per index will be 4.
@@ -512,6 +630,8 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 				      ++line_num ) {
 
 					char* s = c;
+
+					skip_comments_or_empty_lines();
 
 					auto three = strtoul( s, &s, 0 );
 					assert( three == 3 ); // first element must be three
@@ -532,6 +652,7 @@ static bool le_mesh_load_from_ply_file( le_mesh_o* self, char const* file_path_ 
 				      ++line_num ) {
 
 					char* s = c;
+					skip_comments_or_empty_lines();
 
 					auto three = strtoul( s, &s, 0 );
 					assert( three == 3 ); // first element must be three

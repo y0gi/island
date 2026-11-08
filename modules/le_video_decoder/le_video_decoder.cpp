@@ -476,7 +476,7 @@ static le_video_decoder_o* le_video_decoder_create( le_renderer_o* renderer, cha
 	    .sType         = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PROFILE_INFO_KHR,
 	    .pNext         = nullptr,
 	    .stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_BASELINE,
-	    .pictureLayout = VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_INTERLACED_INTERLEAVED_LINES_BIT_KHR,
+	    .pictureLayout = VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR,
 	};
 	self->settings.profile_info = {
 	    .sType               = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR,
@@ -2744,7 +2744,7 @@ static void le_video_decoder_update( le_video_decoder_o* self, le_rendergraph_o*
 			auto&       mem_frame = self->memory_frames[ self->memory_frame_idx_recording ];
 
 			le_on_frame_clear_callback_data_t callback_data{
-			    .cb_fun    = le_video_decoder::le_video_decoder_i.on_backend_frame_clear_cb,
+			    .cb_fun    = &le_video_decoder::le_video_decoder_i.on_backend_frame_clear_cb,
 			    .user_data = &mem_frame,
 			};
 

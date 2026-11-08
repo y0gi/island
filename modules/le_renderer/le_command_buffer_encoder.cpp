@@ -4,6 +4,7 @@
 
 #include "le_backend_vk.h"                             // for GPU allocators
 #include "private/le_backend_vk/le_command_stream_t.h" // for le_command_stream_t
+#include "le_log.h"
 
 #include <cstring>
 #include <iostream>
@@ -23,6 +24,11 @@
 #if ( LE_MT > 0 )
 #	include "le_jobs.h"
 #endif
+
+static auto& logger() {
+	static le::Log log( "command_buffer_encoder" );
+	return log;
+}
 
 // ----------------------------------------------------------------------
 // return allocator offset based on current worker thread index.
@@ -125,6 +131,7 @@ static void cbe_get_extent( le_command_buffer_encoder_o* self, le::Extent2D* ext
 
 // ----------------------------------------------------------------------
 
+// TODO: this should be deprecated
 static void cbe_set_line_width( le_command_buffer_encoder_o* self, float lineWidth ) {
 
 	auto cmd        = self->mCommandStream->emplace_cmd<le::CommandSetLineWidth>(); // placement new into data array
@@ -323,10 +330,18 @@ static void cbe_bind_vertex_buffers( le_command_buffer_encoder_o*     self,
 	uint64_t*                  dataOffsets = ( uint64_t* )( dataBuffers + bindingCount ); // start address for offset data
 
 	cmd->info = { firstBinding, bindingCount };
-	cmd->header.info.size += data_size; // we must increase the size of this command by its payload size
+	cmd->header.info.size += data_size; // append payload size to size of this command entry
 
 	memcpy( dataBuffers, pBuffers, data_buffers_size );
-	memcpy( dataOffsets, pOffsets, data_offsets_size );
+
+	if ( nullptr == pOffsets ) {
+		// If pOffsets was not given, zero out offset data
+		// which means that there will be no offsets
+		memset( dataOffsets, 0, data_offsets_size );
+	} else {
+		// Otherwise copy offsets from user data.
+		memcpy( dataOffsets, pOffsets, data_offsets_size );
+	}
 }
 
 // ----------------------------------------------------------------------
@@ -582,6 +597,10 @@ static void cbe_set_argument_tlas( le_command_buffer_encoder_o* self, le_tlas_re
 
 static void cbe_bind_graphics_pipeline( le_command_buffer_encoder_o* self, le_gpso_handle gpsoHandle ) {
 
+	if ( gpsoHandle == nullptr ) {
+		logger().error( "Pipeline handle is null" );
+		return;
+	}
 	// -- insert graphics PSO pointer into command stream
 	auto cmd = self->mCommandStream->emplace_cmd<le::CommandBindGraphicsPipeline>();
 
@@ -787,6 +806,11 @@ static void cbe_bind_rtx_pipeline( le_command_buffer_encoder_o* self, le_shader_
 
 static void cbe_bind_compute_pipeline( le_command_buffer_encoder_o* self, le_cpso_handle cpsoHandle ) {
 
+	if ( cpsoHandle == nullptr ) {
+		logger().error( "Pipeline handle is null" );
+		return;
+	}
+
 	// -- insert compute PSO pointer into command stream
 	auto cmd = self->mCommandStream->emplace_cmd<le::CommandBindComputePipeline>();
 
@@ -964,6 +988,23 @@ static void cbe_map_image( le_command_buffer_encoder_o*        self,
 		return;
 	}
 }
+
+// ----------------------------------------------------------------------
+static void cbe_insert_debug_message( le_command_buffer_encoder_o* self, char const* debug_message, uint64_t num_bytes, uint32_t priority ) {
+
+	auto cmd = self->mCommandStream->emplace_cmd<le::CommandDebugMessage>( num_bytes ); // placement new!
+
+	// We point data to the next available position in the data stream
+	// so that we can store the data for push constants inline.
+	void* data = ( cmd + 1 ); // one after size of command struct
+
+	cmd->info = { num_bytes, priority };
+	cmd->header.info.size += uint32_t( num_bytes ); // we must increase the size of this command by its payload size
+
+	// copy data into command stream
+	memcpy( data, debug_message, num_bytes );
+}
+
 // ----------------------------------------------------------------------
 static void cbe_set_push_constant_data( le_command_buffer_encoder_o* self, void const* src_data, uint64_t num_bytes ) {
 
@@ -1138,6 +1179,7 @@ void register_le_command_buffer_encoder_api( void* api_ ) {
 	    .destroy              = cbe_destroy,
 	    .get_pipeline_manager = cbe_get_pipeline_manager,
 	    .get_encoded_data     = cbe_get_encoded_data,
+	    .insert_debug_message = cbe_insert_debug_message,
 	};
 
 	cbe_graphics_i = {

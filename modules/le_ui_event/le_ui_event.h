@@ -163,6 +163,14 @@ struct LeUiEvent {
 		eMenu         = 348,
 	};
 
+	enum class NamedButton : int32_t { 
+		eLeft = 0, 
+		eRight, 
+		eMiddle, 
+		eX1, 
+		eX2 
+	};
+
 	enum class ButtonAction : int32_t {
 		eRelease = 0,
 		ePress,
@@ -203,7 +211,7 @@ struct LeUiEvent {
 	};
 
 	struct MouseButtonEvent {
-		int32_t      button;
+		NamedButton  button;
 		ButtonAction action;
 		int32_t      mods;
 	};

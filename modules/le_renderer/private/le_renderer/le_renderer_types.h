@@ -128,7 +128,7 @@ struct le_resource_handle_t {
 
 		// ---- high bits
 
-		// in case we have an image, we want to store the number of samles
+		// in case we have an image, we want to store the number of samples
 
 		if ( type == LeResourceType::eImage ) {
 			handle |= ( uint64_t( num_samples ) & 0x3 ) << 32; // 2 bits = 34
@@ -169,8 +169,6 @@ struct le_resource_handle_t {
 		uint32_t    type_id = uint32_t( ( reinterpret_cast<uint64_t const&>( p ) >> 8 ) & 0xf ); // 4 bits
 		return LeResourceType( type_id );
 	}
-
-	// 2 bits for either num_samples or buffer usage flags
 
 	inline uint32_t get_version() {
 		void const* p = this;
@@ -347,14 +345,14 @@ struct LeResourceUsageFlags {
  *
  */
 struct le_on_frame_clear_callback_data_t {
-	typedef void( cb_fun_t )( void* user_data );
+	typedef void ( *cb_fun_t )( void* user_data ); // function pointer
 	/* NOTE: We use a pointer-to-function-pointer for cb_fun, so that we can be sure that
 	 * the callback function has not become stale via hot-reloading. To provide a callback
 	 * you point at the function address in a private or public le_interface. This gives us
 	 * hot-reloading safety at the cost of an extra indirection.
 	 */
-	cb_fun_t* cb_fun;    // function to call upon frame clear
-	void*     user_data; // user data to pass into function
+	cb_fun_t const* cb_fun;    // const pointer to function pointer to call upon frame clear
+	void*           user_data; // user data to pass into function
 };
 
 namespace le {
@@ -448,6 +446,8 @@ struct le_image_attachment_info_t {
 	le::AttachmentStoreOp storeOp = le::AttachmentStoreOp::eStore; //
 
 	le::ClearValue clearValue = DefaultClearValueColor; // only used if loadOp == clear
+
+	uint32_t viewMask = 0; // if not 0, then multiview is active
 };
 
 static constexpr le_image_attachment_info_t LeDepthAttachmentInfo() {
@@ -1008,12 +1008,12 @@ enum class le_vertex_input_rate : uint8_t {
 struct le_vertex_input_attribute_description {
 	union {
 		struct {
-			uint8_t     location;       /// 0..32 shader attribute location
-			uint8_t     binding;        /// 0..32 binding slot
+			uint8_t     location;       /// 0..31 shader attribute location
+			uint8_t     binding;        /// 0..31 binding slot
 			uint16_t    binding_offset; /// 0..65565 offset for this location within binding (careful: must not be larger than maxVertexInputAttributeOffset [0.0x7ff])
 			le_num_type type;           /// base type for attribute
 			uint8_t     vecsize;        /// 0..7 number of elements of base type
-			uint8_t     isNormalised;   /// whether this input comes pre-normalized
+			uint16_t    isNormalised;   /// whether this input comes pre-normalized
 		};
 		uint64_t raw_data = 0;
 	};
@@ -1039,6 +1039,9 @@ struct LeShaderGroupDataHeader {
 };
 
 namespace le {
+
+using ResourceType = LeResourceType;
+
 enum class CommandType : uint32_t {
 	eDrawIndexed,
 	eDraw,
@@ -1070,6 +1073,7 @@ enum class CommandType : uint32_t {
 	eWriteToBuffer,
 	eWriteToImage,
 	eVideoDecoderExecuteCallback,
+	eDebugMessage,
 };
 
 struct CommandHeader {
@@ -1186,6 +1190,14 @@ struct CommandSetPushConstantData {
 	CommandHeader header = { { { CommandType::eSetPushConstantData, sizeof( CommandSetPushConstantData ) } } };
 	struct {
 		uint64_t num_bytes;
+	} info;
+};
+
+struct CommandDebugMessage {
+	CommandHeader header = { { { CommandType::eDebugMessage, sizeof( CommandDebugMessage ) } } };
+	struct {
+		uint64_t num_bytes;
+		uint32_t priority;
 	} info;
 };
 

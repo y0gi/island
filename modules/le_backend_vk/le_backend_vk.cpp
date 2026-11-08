@@ -29,6 +29,7 @@
 #include <cstring> // for memcpy
 #include <array>
 #include <algorithm> // for std::find, for std::max
+#include <bit>
 
 #include "3rdparty/le_backend_vk/volk/volk.h"
 
@@ -429,7 +430,6 @@ struct ResourceState {
 	                                      // if any of these are WRITE accesses, these must be made available(flushed)
 	                                      // before next access - for the next src access we can OR this with ANY_WRITES
 	VkImageLayout layout;                 // Current layout (for images)
-	uint32_t      renderpass_index;       // which renderpass currently uses this resource  -1 being outside of scope (e.g. swapchain)
 
 	bool operator==( const ResourceState& rhs ) const {
 		return visible_access == rhs.visible_access &&
@@ -582,8 +582,9 @@ struct BackendFrameData {
 	std::vector<VkSemaphore>                        retired_semaphores;          // semaphores that were retired by this frame - these should be clearable upon the frame fence being cleared.
 
 	struct Texture {
-		VkSampler   sampler;
-		VkImageView imageView;
+		VkSampler   sampler   = nullptr;
+		VkImageView imageView = nullptr;
+		le_image_resource_handle debug_parent_image_handle; // only used for debug, so that we can tell which image this texture refers to
 	};
 
 	using texture_map_t = std::unordered_map<le_texture_handle, Texture>;
@@ -596,9 +597,6 @@ struct BackendFrameData {
 	// up the sync state for a resource at different stages of renderpass construction.
 	using sync_chain_table_t = std::unordered_map<le_resource_handle, std::vector<ResourceState>>;
 	sync_chain_table_t syncChainTable;
-
-	// last implicitly synchronised synch chain index for resources that need to be explicitly synched
-	std::unordered_map<le_resource_handle, uint32_t> explicit_sync_requests;
 
 	static_assert( sizeof( VkBuffer ) == sizeof( VkImageView ) && sizeof( VkBuffer ) == sizeof( VkImage ), "size of AbstractPhysicalResource components must be identical" );
 
@@ -913,9 +911,9 @@ static void backend_destroy( le_backend_o* self ) {
 		using namespace le_backend_vk;
 
 		{
-			// Call on_clear_callbacks with tear_down flag set
+			// Call any leftover on_clear_callbacks
 			for ( auto& c : frameData.on_clear_callbacks ) {
-				c.cb_fun( c.user_data );
+				( **c.cb_fun )( c.user_data );
 			}
 			frameData.on_clear_callbacks.clear();
 		}
@@ -1795,6 +1793,10 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 	size_t                            numImageAttachments = 0;
 
 	renderpass_i.get_image_attachments( pass, &pImageAttachments, &pResources, &numImageAttachments );
+
+	// if we are multisampling we will need a resolve attachment for each image or depth attachment
+	currentPass.attachments.resize( numSamplesLog2 == 0 ? numImageAttachments : numImageAttachments * 2, {} );
+
 	for ( size_t i = 0; i != numImageAttachments; ++i ) {
 
 		auto const& image_attachment_info = pImageAttachments[ i ];
@@ -1827,7 +1829,7 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 		bool isDepthStencil = isDepth || isStencil;
 
 		AttachmentInfo* currentAttachment =
-		    currentPass.attachments +
+		    currentPass.attachments.data() +
 		    currentPass.numColorAttachments +
 		    currentPass.numDepthStencilAttachments +
 		    currentPass.numResolveAttachments;
@@ -1846,9 +1848,12 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 		currentAttachment->loadOp     = image_attachment_info.loadOp;
 		currentAttachment->storeOp    = image_attachment_info.storeOp;
 		currentAttachment->clearValue = image_attachment_info.clearValue;
+		currentAttachment->viewMask   = image_attachment_info.viewMask;
 
 		{
 			// track resource state before entering a subpass
+
+			// This are our requirements for the resource before we can start with this renderpass
 
 			auto&         previousSyncState = syncChain.back();
 			ResourceState beforeFirstUse{ previousSyncState };
@@ -1873,7 +1878,6 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 				beforeFirstUse.visible_access = VkAccessFlagBits2( 0 );
 			}
 
-			currentAttachment->initialStateOffset = uint16_t( syncChain.size() );
 			syncChain.emplace_back( std::move( beforeFirstUse ) ); // attachment initial state for a renderpass - may be loaded/cleared on first use
 			                                                       // * sync state: ready for load/store *
 		}
@@ -1906,7 +1910,7 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 
 				if ( isDepthStencil ) {
 					beforeSubpass.visible_access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-					beforeSubpass.stage          = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+					beforeSubpass.stage          = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
 					beforeSubpass.layout         = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 				} else {
 					beforeSubpass.visible_access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1915,16 +1919,9 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 				}
 			}
 
+			currentAttachment->sync_chain_offset = uint16_t( syncChain.size() );
 			syncChain.emplace_back( std::move( beforeSubpass ) );
 		}
-
-		// TODO: here, go through command instructions for renderpass and update resource chain if necessary.
-		// If resource is modified by commands inside the renderpass, this needs to be added to the sync chain here.
-
-		// Whichever next resource state will be in the sync chain will be the resource state we should transition to
-		// when defining the last_subpass_to_external dependency
-		// which is why, optimistically, we designate the index of the next, not yet written state here -
-		currentAttachment->finalStateOffset = uint16_t( syncChain.size() );
 
 	} // end foreach image attachment
 
@@ -1954,7 +1951,7 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 		le_format_get_is_depth_stencil( attachmentFormat, isDepth, isStencil );
 		bool isDepthStencil = isDepth || isStencil;
 
-		AttachmentInfo* currentAttachment = currentPass.attachments +
+		AttachmentInfo* currentAttachment = currentPass.attachments.data() +
 		                                    currentPass.numColorAttachments +
 		                                    currentPass.numDepthStencilAttachments +
 		                                    currentPass.numResolveAttachments;
@@ -1972,11 +1969,8 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 
 		{
 			// track resource state before entering a subpass
-
 			auto& previousSyncState = syncChain.back();
 			auto  beforeFirstUse{ previousSyncState };
-
-			currentAttachment->initialStateOffset = uint16_t( syncChain.size() );
 			syncChain.emplace_back( beforeFirstUse ); // attachment initial state for a renderpass - may be loaded/cleared on first use
 			                                          // * sync state: ready for load/store *
 		}
@@ -2001,16 +1995,9 @@ static void le_renderpass_add_attachments( le_renderpass_o const* pass, BackendR
 				}
 			}
 
+			currentAttachment->sync_chain_offset = uint16_t( syncChain.size() );
 			syncChain.emplace_back( std::move( beforeSubpass ) );
 		}
-
-		// TODO: here, go through command instructions for renderpass and update resource chain if necessary.
-		// If resource is modified by commands inside the renderpass, this needs to be added to the sync chain here.
-
-		// Whichever next resource state will be in the sync chain will be the resource state we should transition to
-		// when defining the last_subpass_to_external dependency
-		// which is why, optimistically, we designate the index of the next, not yet written state here -
-		currentAttachment->finalStateOffset = uint16_t( syncChain.size() );
 
 	} // end foreach image attachment
 }
@@ -2041,6 +2028,7 @@ static void le_renderpass_add_explicit_sync( le_renderpass_o const* pass, Backen
 	le_resource_handle const* resources        = nullptr;
 	le::AccessFlags2 const*   resources_access = nullptr;
 	size_t                    resources_count  = 0;
+
 	renderpass_i.get_used_resources( pass, &resources, &resources_access, nullptr, &resources_count );
 
 	currentPass.resources.assign( resources, resources + resources_count );
@@ -2070,7 +2058,6 @@ static void le_renderpass_add_explicit_sync( le_renderpass_o const* pass, Backen
 		ExplicitSyncOp syncOp{};
 
 		syncOp.resource                  = resource;
-		syncOp.active                    = true;
 		syncOp.sync_chain_offset_initial = uint32_t( syncChain.size() - 1 );
 
 		ResourceState requestedState{}; // State we want our image to be in when pass begins.
@@ -2104,7 +2091,9 @@ static void le_renderpass_add_explicit_sync( le_renderpass_o const* pass, Backen
 					// we can also assume that a barrier will not be needed.
 					//
 					//
-					if ( previous_sync_state.layout == requestedState.layout && previous_sync_state.stage == VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT && previous_sync_state.visible_access == VkAccessFlagBits2( 0 ) ) {
+					if ( previous_sync_state.layout == requestedState.layout &&
+					     previous_sync_state.stage == VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT &&
+					     previous_sync_state.visible_access == VkAccessFlagBits2( 0 ) ) {
 						continue;
 					}
 				}
@@ -2120,59 +2109,173 @@ static void le_renderpass_add_explicit_sync( le_renderpass_o const* pass, Backen
 				requestedState.visible_access = resources_access[ i ];
 				requestedState.stage          = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
 				requestedState.layout         = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			} else if ( resources_access[ i ] & ( VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT ) ) {
+				if ( currentPass.sampleCount == le::SampleCountFlagBits::e1 ) {
+					// simple case - the pass is not multisampling
+					requestedState.visible_access = resources_access[ i ];
+					requestedState.stage          = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+					requestedState.layout         = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+				} else {
+
+					// In case we have a multisample attachment, we must prepare to issue two sync
+					// commands: one for the main texture (which is used as a resolve attachment)
+					// and one for the multisampled texture (which is used as the color attachment).
+
+					requestedState.visible_access = VK_ACCESS_2_MEMORY_READ_BIT;
+					requestedState.stage          = VK_PIPELINE_STAGE_2_RESOLVE_BIT;
+					requestedState.layout         = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+
+					{
+
+						ResourceState resolve_requestedState{};    // State we want our image to be in when pass begins.
+						resolve_requestedState.visible_access = 0; // the color attachment does not need to make anything visible - it is write-only
+						resolve_requestedState.stage          = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+						resolve_requestedState.layout         = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+
+						uint32_t numSamplesLog2 = get_sample_count_log_2( uint32_t( currentPass.sampleCount ) );
+
+						auto resolve_resource = ( ( le_image_resource_handle )resource )->clone_with_num_samples( numSamplesLog2 );
+
+						auto& rsc = syncChainTable[ resolve_resource ];
+						assert( !rsc.empty() ); // must not be empty - this resource must exist, and have an initial sync state
+
+						ExplicitSyncOp so{
+						    .resource                  = resolve_resource,
+						    .sync_chain_offset_initial = uint32_t( rsc.size() - 1 ),
+						    .sync_chain_offset_final   = uint32_t( rsc.size() ),
+						};
+
+						rsc.emplace_back( resolve_requestedState );
+
+						// -- Add an explicit sync op so that the change happens before the pass
+						//
+						// Let's only add the sync op if this is the first transition for this element
+						// NOTE: Because we add an explicit sync op if this is the first transition
+						//       for a resource, this means that we must make sure not to transition
+						//       the same resources again at the end of a renderpass; At the end of the
+						//       renderpass we therefore only add an explicit sync op if that is NOT
+						//       the first transition for this resource.
+						//
+						if ( so.sync_chain_offset_initial == 0 ) {
+							currentPass.sync_ops_before_pass.emplace_back( so );
+						}
+					}
+				}
+
+			} else if ( resources_access[ i ] & ( VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT ) ) {
+				if ( currentPass.sampleCount == le::SampleCountFlagBits::e1 ) {
+					// simple case: the pass is not multisampling
+					requestedState.visible_access = resources_access[ i ];
+					requestedState.stage          = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+					requestedState.layout         = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+				} else {
+
+					// In case we have a multisample attachment, we must prepare to issue two sync
+					// commands: one for the main texture (which is used as a resolve attachment)
+					// and one for the multisampled texture (which is used as the color attachment).
+
+					requestedState.visible_access = VK_ACCESS_2_MEMORY_READ_BIT;
+					requestedState.stage          = VK_PIPELINE_STAGE_2_RESOLVE_BIT;
+					requestedState.layout         = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+					{
+
+						ResourceState resolve_requestedState{};    // State we want our image to be in when pass begins.
+						resolve_requestedState.visible_access = 0; // the color attachment does not need to make anything visible - it is write-only
+						resolve_requestedState.stage          = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+						resolve_requestedState.layout         = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+						uint32_t numSamplesLog2 = get_sample_count_log_2( uint32_t( currentPass.sampleCount ) );
+
+						auto resolve_resource = ( ( le_image_resource_handle )resource )->clone_with_num_samples( numSamplesLog2 );
+
+						auto& rsc = syncChainTable[ resolve_resource ];
+						assert( !rsc.empty() ); // must not be empty - this resource must exist, and have an initial sync state
+
+						ExplicitSyncOp so{
+						    .resource                  = resolve_resource,
+						    .sync_chain_offset_initial = uint32_t( rsc.size() - 1 ),
+						    .sync_chain_offset_final   = uint32_t( rsc.size() ),
+						};
+
+						rsc.emplace_back( resolve_requestedState );
+
+						// -- Add an explicit sync op so that the change happens before the pass
+						//
+						// Let's only add the sync op if this is the first transition for this element
+						// NOTE: Because we add an explicit sync op if this is the first transition
+						//       for a resource, this means that we must make sure not to transition
+						//       the same resources again at the end of a renderpass; At the end of the
+						//       renderpass we therefore only add an explicit sync op if that is NOT
+						//       the first transition for this resource.
+						//
+						if ( so.sync_chain_offset_initial == 0 ) {
+							currentPass.sync_ops_before_pass.emplace_back( so );
+						}
+					}
+				}
+
+			} else {
+				requestedState.visible_access = resources_access[ i ];
+				requestedState.stage          = get_stage_flags_based_on_renderpass_type( currentPass.type );
+				requestedState.layout         = VK_IMAGE_LAYOUT_GENERAL;
+				logger().warn( "Unexpected access to image resource: %s", resource->get_debug_name() );
 			}
 
-			else {
-				continue;
+		} else if ( resource->get_type() == LeResourceType::eBuffer ) {
+
+			// Process Buffer Resources
+
+			requestedState.visible_access = resources_access[ i ];
+			requestedState.stage          = get_stage_flags_based_on_renderpass_type( currentPass.type );
+
+			if ( requestedState.visible_access & VK_ACCESS_2_INDEX_READ_BIT ) {
+				requestedState.stage |= VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
+			}
+			if ( requestedState.visible_access & VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT ) {
+				requestedState.stage |= VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT;
 			}
 
 		} else {
-			// Resources other than Images are ignored
-
-			// TODO: whe should probably process buffers here, as skipping the loop here
-			// means that Buffers don't ever get added to pre_pass_sync_ops.
-
-			continue;
+			logger().warn( "Unknown resource type: %d", resource->get_type() );
 		}
+
+		// if the resource is a multisampling image attachment, we must
+		// use the single sampled image as a resolve attachment
+		// and add a multisampling image sync op, so that the multisampling image
+		// is correctly transitioned *before* the renderpass begins.
 
 		// -- we must add an entry to the sync chain to signal the state after change
 		syncChain.emplace_back( requestedState );
 
 		syncOp.sync_chain_offset_final = uint32_t( syncChain.size() - 1 );
 
-		// -- we must add an explicit sync op so that the change happens before the pass - this applies to
-		// passes which don't do implicit syncing, such as compute or transfer passes.
-		currentPass.sync_ops_before_pass.emplace_back( syncOp );
+		// -- Add an explicit sync op so that the change happens before the pass
+		//
+		// Let's only add the sync op if this is the first transition for this element
+		// NOTE: Because we add an explicit sync op if this is the first transition
+		//       for a resource, this means that we must make sure not to transition
+		//       the same resources again at the end of a renderpass; At the end of the
+		//       renderpass we therefore only add an explicit sync op if that is NOT
+		//       the first transition for this resource.
+		//
+		if ( syncOp.sync_chain_offset_initial == 0 ) {
+			currentPass.sync_ops_before_pass.emplace_back( syncOp );
+		}
 	}
 }
 
-static void frame_track_resource_state(
-    BackendFrameData& frame, le_renderpass_o** pp_passes,
-    size_t num_renderpasses, const std::vector<le_image_resource_handle>& swapchain_images, le_renderer_o* renderer ) {
+// ----------------------------------------------------------------------
+
+static void frame_track_resource_state( BackendFrameData& frame, le_renderpass_o** pp_passes, size_t num_renderpasses, const std::vector<le_image_resource_handle>& swapchain_images, le_renderer_o* renderer ) {
 
 	ZoneScoped;
+
 	// A pipeline barrier is defined as a combination of EXECUTION dependency and MEMORY dependency:
 	//
 	// * An EXECUTION DEPENDENCY tells us which stage needs to be complete (srcStage) before another named stage (dstStage) may execute.
 	// * A  MEMORY DEPENDECY     tells us which memory/cache needs to be made available/flushed (srcAccess) after srcStage,
 	//   before another memory/cache can be made visible/invalidated (dstAccess) before dstStage
-
-	// Renderpass implicit sync (per image resource)
-	//
-	// + Enter renderpass : INITIAL LAYOUT (layout must match)
-	// + Layout transition if initial layout and attachment reference layout differ for subpass
-	//   [ attachment memory is automatically made AVAILABLE | see Spec 6.1.1]
-	//   [layout transition happens-before any LOAD OPs: (Source: amd open source driver <https://github.com/GPUOpen-Drivers/xgl/blob/aa330d8e9acffb578c88193e4abe017c8fe15426/icd/api/renderpass/renderpass_builder.cpp#L819>)]
-	// + Load/clear op (executed using INITIAL LAYOUT once before first use per-resource)
-	//   [ attachment memory must be AVAILABLE ]
-	// + Enter subpass
-	// + Command execution [attachment memory must be VISIBLE ]
-	// + Store op
-	// + Exit subpass : final layout
-	// + Exit renderpass
-	// + Layout transform (if final layout differs)
-	//
-	//- NOTE texture image resources *must* be explicitly synchronised:
 
 	auto& syncChainTable = frame.syncChainTable;
 
@@ -2216,21 +2319,70 @@ static void frame_track_resource_state(
 
 		renderpass_i.get_framebuffer_settings( pass, &currentPass.width, &currentPass.height, &currentPass.sampleCount );
 
-		// Find explicit sync ops needed for resources which are not attachments
+		// Insert sync ops for before starting the renderpass
 		//
 		le_renderpass_add_explicit_sync( pass, currentPass, syncChainTable );
+
 
 		// Iterate over all image attachments
 		le_renderpass_add_attachments( pass, currentPass, frame, currentPass.sampleCount, renderer );
 
+		{
+			// Insert sync ops after ending the renderpass
+			//
+			// After a pass we must transfer the resource so that it is ready for the next pass.
+			// How do we know what is needed from the next pass? At this point we don't - but we
+			// know the index of the sync chain table element for the next pass - it it the current
+			// pass index + 1
+
+			std::vector<le_resource_handle> resources;
+			{
+				resources.reserve( currentPass.resources.size() + currentPass.numResolveAttachments );
+				resources.insert( resources.end(), currentPass.resources.begin(), currentPass.resources.end() );
+
+				// If a pass has resolve attachments, then the primary colour and depth attachments
+				// will be temporary multisample images, (the "official" 1-sample images being used
+				// as resolve attachments). The multisample images need to be added to the list of
+				// resources that need to be synced with this renderpass.
+				//
+				for ( size_t i = 0; i != currentPass.numResolveAttachments; i++ ) {
+					resources.emplace_back( currentPass.attachments[ i ].resource );
+				}
+			}
+
+			for ( le_resource_handle r : resources ) {
+
+				uint32_t const sync_pos = syncChainTable.at( r ).size() - 1;
+
+				// Only add an explicit sync op at the end of the renderpass if for this resource
+				// there exists more than one sync op.
+				//
+				// If there exists a single sync op only, then an explicit sync op will have been added
+				// at the start of the next renderpass and we MUST NOT add one here.
+				//
+				if ( sync_pos > 0 ) {
+					currentPass.sync_ops_after_pass.push_back( {
+					    r,
+					    sync_pos,     // last current
+					    sync_pos + 1, // speculative: next state
+					} );
+				}
+			}
+		}
+
 		frame.passes.emplace_back( std::move( currentPass ) );
 	} // end for all passes
 
-	for ( auto& s_entry : syncChainTable ) {
-		const auto& resource_handle = s_entry.first;
-		auto&       sync_chain      = s_entry.second;
+	// Add a final sync stage to all resources so we know that there will always be a stage n+1
 
-		auto finalState{ sync_chain.back() };
+	for ( auto& s_entry : syncChainTable ) {
+
+		// Set the final state for each resource.
+
+		const auto& resource_handle = s_entry.first;
+		std::vector<ResourceState>& sync_chain      = s_entry.second;
+
+		ResourceState finalState{ sync_chain.back() };
 
 		if ( s_entry.first->get_type() != LeResourceType::eBuffer && std::find( swapchain_images.begin(), swapchain_images.end(), resource_handle ) != swapchain_images.end() ) {
 			finalState.stage          = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT; // Everything: Drain the pipeline
@@ -2244,115 +2396,6 @@ static void frame_track_resource_state(
 		}
 
 		sync_chain.emplace_back( std::move( finalState ) );
-	}
-
-	// ------------------------------------------------------
-	// Check for barrier correctness
-	//
-	// Go through all frames and passes and make sure that any explicit sync ops do refer
-	// to sync chain indices which are higher than the current sync chain id for a given resource.
-	//
-	// If they were lower, that would mean that an implicit sync has already taken care of this
-	// image resource operation, in which case we want to deactivate the barrier, as it is not needed.
-	//
-
-	// Note that only resources of type image may be implicitly synced.
-
-	std::unordered_map<le_resource_handle, uint32_t>           max_sync_index;
-	std::unordered_map<le_resource_handle, BackendRenderPass*> resource_last_used_in_pass;
-
-	auto insert_if_greater = [ &max_sync_index ]( le_resource_handle const& key, uint32_t value ) {
-		// Updates map entry to highest value
-		auto& element = max_sync_index[ key ];
-		element       = std::max( element, value );
-	};
-
-	for ( auto& p : frame.passes ) {
-
-		// Check barrier sync chain index against current sync index.
-		//
-		// If barrier sync index is higher, barrier must be issued. Otherwise,
-		// barrier must be removed, as subpass dependency already takes care
-		// of synchronisation implicitly.
-
-		for ( auto& op : p.sync_ops_before_pass ) {
-
-			if ( op.resource->get_type() != LeResourceType::eImage ) {
-				continue;
-			}
-
-			// ---------| invariant: only image resources need checking
-			//
-			// This is because only image may potentially be synchronised implicitly via
-			// subpass dependencies. No such mechanism exists for buffers.
-			//
-			// We can skip checks for buffer barriers, as we assume they are
-			// all needed.
-
-			auto found_it = max_sync_index.find( op.resource );
-			if ( found_it != max_sync_index.end() && found_it->second >= op.sync_chain_offset_final ) {
-				// found an element, and current index is already higher than barrier index.
-				op.active = false;
-			} else {
-				// no element found, or max index is smaller.
-				op.active = true;
-				// store the current max index, then.
-				max_sync_index[ op.resource ] = op.sync_chain_offset_final;
-			}
-
-			// Track that this image was last seen in this pass
-			// so that we may add one last sync op at the last pass if needed.
-
-			resource_last_used_in_pass[ op.resource ] = &p;
-		}
-
-		// Update max_sync_index, so that it contains the maximum sync chain index for each
-		// attachment image resource used in the current pass.
-		const size_t numAttachments = p.numColorAttachments +
-		                              p.numDepthStencilAttachments +
-		                              p.numResolveAttachments;
-
-		for ( size_t a = 0; a != numAttachments; a++ ) {
-			auto const& attachmentInfo = p.attachments[ a ];
-			insert_if_greater( attachmentInfo.resource, attachmentInfo.finalStateOffset );
-		}
-	}
-
-	// Note this applies only to images as max_sync_index does only get filled with resources
-	// that test positively for being images.
-	//
-	// find out whether the max sync index is correct for all elements in sync chain map
-
-	// We insert explicit sync for any resource that does not get synced
-	// via renderpass transitions before we hand over to the swapchain.
-	// This affects the swapchain surface for example, if it gets drawn into
-	// and then sampled from before being handed over to present.
-	// Implicit (renderpass-based sync) would not affect the image as it is
-	// first explicitly transferred to be sampled from. Since there is no more
-	// renderpass that makes use of this image as an attachment, there would
-	// be no more sync happening to this image.
-	// That's what we therefore need to catch, any images with dangling sync ops
-	// that are not implicitly done via renderpasses; these sync ops need to happen
-	// after the last pass that used the image is done with the image. We attach this
-	// to the last pass because we know that the pass can access the image (correct
-	// queue family).
-	//
-	//
-	for ( auto [ handle, max_idx ] : max_sync_index ) {
-		uint32_t sync_indices_count = syncChainTable[ handle ].size();
-		if ( sync_indices_count > max_idx + 1 ) {
-			frame.explicit_sync_requests[ handle ] = max_idx;
-
-			// Store an explicit post-pass sync request with the last pass that touched a
-			// resource. We store with the last pass because this makes it this pass'es
-			// responsibility to return the resource to the last stage in the sync chain.
-
-			resource_last_used_in_pass[ handle ]->sync_ops_after_pass.push_back( { handle, max_idx, sync_indices_count - 1, true } );
-
-			// logger().warn( "Image %s :: sync chain length %d > %d, last used in pass: %s",
-			//              handle->data->debug_name, syncChainTable[ handle ].size(), max_idx,
-			//              resource_last_used_in_pass[ handle ]->debugName );
-		}
 	}
 }
 
@@ -2421,7 +2464,7 @@ static bool backend_clear_frame( le_backend_o* self, size_t frameIndex ) {
 			 * we do this so that we are protected from the final callback address
 			 * having changed via hot-reloading.
 			 */
-			( *c.cb_fun )( c.user_data );
+			( **c.cb_fun )( c.user_data );
 		}
 		/* We can use these clear callbacks to decrement an intrusive pointer counter
 		 * in video decoder, for example, so that we can make sure that the lifetime
@@ -2476,17 +2519,11 @@ static bool backend_clear_frame( le_backend_o* self, size_t frameIndex ) {
 			case AbstractPhysicalResource::eBuffer:
 				vkDestroyBuffer( device, r.asBuffer, nullptr );
 				break;
-			case AbstractPhysicalResource::eFramebuffer:
-				vkDestroyFramebuffer( device, r.asFramebuffer, nullptr );
-				break;
 			case AbstractPhysicalResource::eImage:
 				vkDestroyImage( device, r.asImage, nullptr );
 				break;
 			case AbstractPhysicalResource::eImageView:
 				vkDestroyImageView( device, r.asImageView, nullptr );
-				break;
-			case AbstractPhysicalResource::eRenderPass:
-				vkDestroyRenderPass( device, r.asRenderPass, nullptr );
 				break;
 			case AbstractPhysicalResource::eSampler:
 				vkDestroySampler( device, r.asSampler, nullptr );
@@ -2512,8 +2549,8 @@ static bool backend_clear_frame( le_backend_o* self, size_t frameIndex ) {
 	frame.queue_submission_data.clear();
 
 	frame.physicalResources.clear();
+
 	frame.syncChainTable.clear();
-	frame.explicit_sync_requests.clear();
 
 	frame.passes.clear();
 
@@ -2553,355 +2590,6 @@ static constexpr auto ANY_WRITE_VK_ACCESS_2_FLAGS =
       VK_ACCESS_2_VIDEO_ENCODE_WRITE_BIT_KHR
 #endif
     );
-
-// ----------------------------------------------------------------------
-// Executes on the DISPATCH FRAME
-//
-static void backend_create_renderpasses( BackendFrameData& frame, VkDevice& device ) {
-	ZoneScoped;
-
-	const auto& syncChainTable = frame.syncChainTable;
-
-	// Note: This should be trivial to parallelize.
-	for ( auto& pass : frame.passes ) {
-
-		// The rest of this loop only concerns draw passes
-		//
-		if ( pass.type != le::QueueFlagBits::eGraphics ) {
-			continue;
-		}
-
-		// ---------| Invariant: current pass is a draw pass.
-
-		std::vector<VkAttachmentDescription2> attachments;
-		attachments.reserve( pass.numColorAttachments + pass.numDepthStencilAttachments );
-
-		std::vector<VkAttachmentReference2> colorAttachmentReferences;
-		std::vector<VkAttachmentReference2> resolveAttachmentReferences;
-		VkAttachmentReference2*             dsAttachmentReference = nullptr;
-
-		// We must accumulate these flags over all attachments - they are the
-		// union of all flags required by all attachments in a pass.
-		VkPipelineStageFlags2 srcStageFromExternalFlags  = 0;
-		VkPipelineStageFlags2 dstStageFromExternalFlags  = 0;
-		VkAccessFlags2        srcAccessFromExternalFlags = 0;
-		VkAccessFlags2        dstAccessFromExternalFlags = 0;
-
-		VkPipelineStageFlags2 srcStageToExternalFlags  = 0;
-		VkPipelineStageFlags2 dstStageToExternalFlags  = 0;
-		VkAccessFlags2        srcAccessToExternalFlags = 0;
-		VkAccessFlags2        dstAccessToExternalFlags = 0;
-
-		if ( LE_PRINT_DEBUG_MESSAGES ) {
-			logger().info( "* Renderpass: '%s'", pass.debugName );
-			logger().info( " %40s : %30s : %30s : %30s", "Attachment", "Layout initial", "Layout subpass", "Layout final" );
-		}
-
-		auto const attachments_end = pass.attachments +
-		                             pass.numColorAttachments +
-		                             pass.numDepthStencilAttachments +
-		                             pass.numResolveAttachments;
-
-		for ( AttachmentInfo const* attachment = pass.attachments; attachment != attachments_end; attachment++ ) {
-
-			auto& syncChain = syncChainTable.at( attachment->resource );
-
-			const auto& syncInitial = syncChain.at( attachment->initialStateOffset );
-			const auto& syncSubpass = syncChain.at( attachment->initialStateOffset + 1 );
-			const auto& syncFinal   = syncChain.at( attachment->finalStateOffset );
-
-			bool isDepth   = false;
-			bool isStencil = false;
-			le_format_get_is_depth_stencil( attachment->format, isDepth, isStencil );
-
-			VkAttachmentDescription2 attachmentDescription{
-			    .sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
-			    .pNext          = nullptr,                        // optional
-			    .flags          = VkAttachmentDescriptionFlags(), // optional
-			    .format         = VkFormat( attachment->format ),
-			    .samples        = VkSampleCountFlagBits( attachment->numSamples ),
-			    .loadOp         = VkAttachmentLoadOp( attachment->loadOp ),
-			    .storeOp        = VkAttachmentStoreOp( attachment->storeOp ),
-			    .stencilLoadOp  = isStencil ? VkAttachmentLoadOp( attachment->loadOp ) : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-			    .stencilStoreOp = isStencil ? VkAttachmentStoreOp( attachment->storeOp ) : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-			    .initialLayout  = syncInitial.layout,
-			    .finalLayout    = syncFinal.layout,
-			};
-
-			if ( LE_PRINT_DEBUG_MESSAGES ) {
-				logger().info( " %38s@%d : %30s → %30s → %30s | sync chain indices: %4d : %4d : %4d",
-				               attachment->resource->get_debug_name(), 1 << attachment->resource->get_num_samples(),
-				               to_str_vk_image_layout( syncInitial.layout ),
-				               to_str_vk_image_layout( syncSubpass.layout ),
-				               to_str_vk_image_layout( syncFinal.layout ),
-				               attachment->initialStateOffset,
-				               attachment->initialStateOffset + 1,
-				               attachment->finalStateOffset );
-			}
-
-			attachments.emplace_back( attachmentDescription );
-
-			switch ( attachment->type ) {
-			case AttachmentInfo::Type::eDepthStencilAttachment:
-				dsAttachmentReference = new VkAttachmentReference2{
-				    .sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-				    .pNext      = nullptr, // optional
-				    .attachment = uint32_t( attachments.size() - 1 ),
-				    .layout     = syncSubpass.layout,
-				    .aspectMask = 0,
-				}; // cleanup at the end of loop
-				break;
-			case AttachmentInfo::Type::eColorAttachment:
-				colorAttachmentReferences.push_back( {
-				    .sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-				    .pNext      = nullptr, // optional
-				    .attachment = uint32_t( attachments.size() - 1 ),
-				    .layout     = syncSubpass.layout,
-				    .aspectMask = 0,
-				} );
-				break;
-			case AttachmentInfo::Type::eResolveAttachment:
-				resolveAttachmentReferences.push_back( {
-				    .sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
-				    .pNext      = nullptr, // optional
-				    .attachment = uint32_t( attachments.size() - 1 ),
-				    .layout     = syncSubpass.layout,
-				    .aspectMask = 0,
-				} );
-				break;
-			}
-
-			srcStageFromExternalFlags |= syncInitial.stage;
-			dstStageFromExternalFlags |= syncSubpass.stage;
-			srcAccessFromExternalFlags |= ( syncInitial.visible_access & ANY_WRITE_VK_ACCESS_2_FLAGS );
-			dstAccessFromExternalFlags |= syncSubpass.visible_access; // & ~(syncInitial.visible_access );
-			// this would make only changes in availability operations happen. it should only happen if there are no src write_access_flags. we leave this out so as to give the driver more info
-
-			// TODO: deal with other subpasses ...
-
-			srcStageToExternalFlags |= syncChain.at( attachment->finalStateOffset - 1 ).stage;
-			dstStageToExternalFlags |= syncFinal.stage;
-			srcAccessToExternalFlags |= ( syncChain.at( attachment->finalStateOffset - 1 ).visible_access & ANY_WRITE_VK_ACCESS_2_FLAGS );
-			dstAccessToExternalFlags |= syncFinal.visible_access;
-
-			if ( 0 == uint64_t( srcStageFromExternalFlags ) ) {
-				// Ensure that the stage mask is valid if no src stage was specified.
-				srcStageFromExternalFlags = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-			}
-		}
-
-		if ( LE_PRINT_DEBUG_MESSAGES ) {
-			logger().info( "" );
-		}
-
-		std::vector<VkSubpassDescription2> subpasses;
-		subpasses.reserve( 1 );
-
-		{
-			VkSubpassDescription2 subpassDescription{
-			    .sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
-			    .pNext                   = nullptr, // optional
-			    .flags                   = 0,       // optional
-			    .pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS,
-			    .viewMask                = 0,
-			    .inputAttachmentCount    = 0, // optional
-			    .pInputAttachments       = nullptr,
-			    .colorAttachmentCount    = uint32_t( colorAttachmentReferences.size() ), // optional
-			    .pColorAttachments       = colorAttachmentReferences.data(),
-			    .pResolveAttachments     = resolveAttachmentReferences.empty() ? nullptr : resolveAttachmentReferences.data(), // optional
-			    .pDepthStencilAttachment = dsAttachmentReference,                                                              // optional
-			    .preserveAttachmentCount = 0,                                                                                  // optional
-			    .pPreserveAttachments    = nullptr,
-			};
-
-			subpasses.emplace_back( subpassDescription );
-		}
-
-		VkMemoryBarrier2     memoryBarriers[ 2 ];
-		VkSubpassDependency2 dependencies[ 2 ];
-
-		{
-			if ( LE_PRINT_DEBUG_MESSAGES ) {
-
-				logger().info( "Subpass Dependency: VK_SUBPASS_EXTERNAL to subpass `%s`", pass.debugName );
-				logger().info( "\t srcStage: %-40s Anything in stage %1$s must happen-before", to_string_vk_pipeline_stage_flags2( srcStageFromExternalFlags ).c_str() );
-				logger().info( "\t dstStage: %-40s anything in stage %1$s.", to_string_vk_pipeline_stage_flags2( dstStageFromExternalFlags ).c_str() );
-				uint64_t( srcAccessFromExternalFlags )
-				    ? logger().info( "\tsrcAccess: %-40s Memory from stage %s, accessing %1$s must be made available", to_string_vk_access_flags2( srcAccessFromExternalFlags ).c_str(), to_string_vk_pipeline_stage_flags2( srcStageFromExternalFlags ).c_str() )
-				    : logger().info( "\tsrcAccess: %-40s No memory needs to be made available", to_string_vk_access_flags2( srcAccessFromExternalFlags ).c_str() );
-				logger().info( "\tdstAccess: %-40s before memory is made visible to %1$s in stage %s", to_string_vk_access_flags2( dstAccessFromExternalFlags ).c_str(), to_string_vk_pipeline_stage_flags2( dstStageFromExternalFlags ).c_str() );
-
-				logger().info( "Subpass Dependency: subpass `%s` to VK_SUBPASS_EXTERNAL:", pass.debugName );
-				logger().info( "\t srcStage: %-40s Anything in stage %1$s must happen-before", to_string_vk_pipeline_stage_flags2( srcStageToExternalFlags ).c_str() );
-				logger().info( "\t dstStage: %-40s anything in stage %1$s.", to_string_vk_pipeline_stage_flags2( dstStageToExternalFlags ).c_str() );
-				uint64_t( srcAccessToExternalFlags )
-				    ? logger().info( "\tsrcAccess: %-40s Memory from stage %s, accessing %1$s must be made available", to_string_vk_access_flags2( srcAccessToExternalFlags ).c_str(), to_string_vk_pipeline_stage_flags2( srcStageToExternalFlags ).c_str() )
-				    : logger().info( "\tsrcAccess: %-40s No memory needs to be made available", to_string_vk_access_flags2( srcAccessToExternalFlags ).c_str() );
-				logger().info( "\tdstAccess: %-40s before memory is made visible to %1$s in stage %s", to_string_vk_access_flags2( dstAccessToExternalFlags ).c_str(), to_string_vk_pipeline_stage_flags2( dstStageToExternalFlags ).c_str() );
-				logger().info( "" );
-			}
-
-			memoryBarriers[ 0 ] = {
-			    .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-			    .pNext         = nullptr,
-			    .srcStageMask  = srcStageFromExternalFlags,
-			    .srcAccessMask = srcAccessFromExternalFlags,
-			    .dstStageMask  = dstStageFromExternalFlags,
-			    .dstAccessMask = dstAccessFromExternalFlags,
-			};
-			memoryBarriers[ 1 ] = {
-			    .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-			    .pNext         = nullptr,
-			    .srcStageMask  = srcStageToExternalFlags,
-			    .srcAccessMask = srcAccessToExternalFlags,
-			    .dstStageMask  = dstStageToExternalFlags,
-			    .dstAccessMask = dstAccessToExternalFlags,
-			};
-
-			dependencies[ 0 ] = {
-			    // external to subpass
-			    .sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-			    .pNext           = memoryBarriers,              // optional
-			    .srcSubpass      = VK_SUBPASS_EXTERNAL,         // outside of renderpass
-			    .dstSubpass      = 0,                           // first subpass
-			    .srcStageMask    = 0,                           // not used
-			    .dstStageMask    = 0,                           // not used
-			    .srcAccessMask   = 0,                           // not used
-			    .dstAccessMask   = 0,                           // not used
-			    .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT, // optional
-			    .viewOffset      = 0,
-			};
-			dependencies[ 1 ] = {
-			    // subpass to external
-			    .sType           = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2,
-			    .pNext           = memoryBarriers + 1,          // optional
-			    .srcSubpass      = 0,                           // last subpass
-			    .dstSubpass      = VK_SUBPASS_EXTERNAL,         // outside of subpass
-			    .srcStageMask    = 0,                           // not used
-			    .dstStageMask    = 0,                           // not used
-			    .srcAccessMask   = 0,                           // not used
-			    .dstAccessMask   = 0,                           // not used
-			    .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT, // optional
-			    .viewOffset      = 0,
-			};
-		}
-
-		{
-			// -- Build hash for compatible renderpass
-			//
-			// We need to include all information that defines renderpass compatibility.
-			//
-			// We are not clear whether subpasses must be identical between two compatible renderpasses,
-			// therefore we don't include subpass information in calculating renderpass compatibility.
-
-			// -- 1. hash attachments
-			// -- 2. hash subpass descriptions for each subpass
-			//       subpass descriptions are structs with vectors of index references to attachments
-
-			{
-				uint64_t rp_hash = 0;
-
-				// -- hash attachments
-				for ( const auto& a : attachments ) {
-
-					// We use offsetof so that we can get everything from flags to the start of the
-					// attachmentdescription to (but not including) loadOp.
-					static_assert(
-					    offsetof( VkAttachmentDescription2, loadOp ) -
-					            offsetof( VkAttachmentDescription2, flags ) ==
-					        sizeof( VkAttachmentDescription2::flags ) +
-					            sizeof( VkAttachmentDescription2::format ) +
-					            sizeof( VkAttachmentDescription2::samples ),
-					    "AttachmentDescription struct must be tightly packed for efficient hashing" );
-
-					rp_hash = SpookyHash::Hash64(
-					    &a.flags, offsetof( VkAttachmentDescription2, loadOp ) - offsetof( VkAttachmentDescription2, flags ),
-					    rp_hash );
-				}
-
-				// -- Hash subpasses
-				for ( const auto& s : subpasses ) {
-
-					// Note: Attachment references are not that straightforward to hash either, as they contain a layout
-					// field, which we want to ignore, since it makes no difference for render pass compatibility.
-
-					rp_hash = SpookyHash::Hash64( &s.flags, sizeof( s.flags ), rp_hash );
-					rp_hash = SpookyHash::Hash64( &s.pipelineBindPoint, sizeof( s.pipelineBindPoint ), rp_hash );
-					rp_hash = SpookyHash::Hash64( &s.inputAttachmentCount, sizeof( s.inputAttachmentCount ), rp_hash );
-					rp_hash = SpookyHash::Hash64( &s.colorAttachmentCount, sizeof( s.colorAttachmentCount ), rp_hash );
-					rp_hash = SpookyHash::Hash64( &s.preserveAttachmentCount, sizeof( s.preserveAttachmentCount ), rp_hash );
-
-					// We define this as a pure function lambda, and hope for it to be inlined
-					auto calc_hash_for_attachment_references = []( VkAttachmentReference2 const* pAttachmentRefs, unsigned int count, uint64_t seed ) -> uint64_t {
-						if ( pAttachmentRefs == nullptr ) {
-							return seed;
-						}
-						// ----------| invariant: pAttachmentRefs is valid
-						for ( auto const* pAr = pAttachmentRefs; pAr != pAttachmentRefs + count; pAr++ ) {
-							// Note: for RenderPass compatibility, only the actual attachment
-							// counts - Layout has no effect on compatibility.
-							seed = SpookyHash::Hash64( &pAr->attachment, sizeof( VkAttachmentReference2::attachment ), seed );
-						}
-						return seed;
-					};
-
-					// -- For each element in attachment reference, add attachment reference index to the hash
-					//
-					rp_hash = calc_hash_for_attachment_references( s.pColorAttachments, s.colorAttachmentCount, rp_hash );
-					rp_hash = calc_hash_for_attachment_references( s.pInputAttachments, s.inputAttachmentCount, rp_hash );
-					rp_hash = calc_hash_for_attachment_references( s.pDepthStencilAttachment, 1, rp_hash );
-
-					// Note that we did not calculate hashes for resolve attachments, as these do not contribute
-					// to renderpass compatibility considerations. See: vkSpec:`7.2. Render Pass Compatibility`
-
-					// -- preserve attachments are special, because they are not stored as attachment references, but as plain indices
-					if ( s.pPreserveAttachments ) {
-						rp_hash = SpookyHash::Hash64( s.pPreserveAttachments, s.preserveAttachmentCount * sizeof( *s.pPreserveAttachments ), rp_hash );
-					}
-				}
-
-				// Store *hash for compatible renderpass* with pass so that pipelines can test whether they are compatible.
-				//
-				// "Compatible renderpass" means the hash is not fully representative of the renderpass,
-				// but two renderpasses with same hash should be compatible, as everything that touches
-				// renderpass compatibility has been factored into calculating the hash.
-				//
-				pass.renderpassHash = rp_hash;
-			}
-
-			VkRenderPassCreateInfo2 renderpassCreateInfo{
-			    .sType                   = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
-			    .pNext                   = nullptr, // optional
-			    .flags                   = 0,       // optional
-			    .attachmentCount         = uint32_t( attachments.size() ),
-			    .pAttachments            = attachments.data(),
-			    .subpassCount            = uint32_t( subpasses.size() ),
-			    .pSubpasses              = subpasses.data(),
-			    .dependencyCount         = uint32_t( sizeof( dependencies ) / sizeof( VkSubpassDependency2 ) ),
-			    .pDependencies           = dependencies,
-			    .correlatedViewMaskCount = 0, // optional
-			    .pCorrelatedViewMasks    = 0,
-			};
-
-			// Create vulkan renderpass object
-
-			vkCreateRenderPass2( device, &renderpassCreateInfo, nullptr, &pass.renderPass );
-
-			delete dsAttachmentReference; // noo-op if nullptr; we clean up here in case we allocated a
-			                              // depth stencil attachment reference above.
-			                              // Once createRenderPass has consumed the data, we can safely delete.
-
-			AbstractPhysicalResource rp;
-			rp.type         = AbstractPhysicalResource::eRenderPass;
-			rp.asRenderPass = pass.renderPass;
-
-			// Add vulkan renderpass object to list of owned and life-time tracked resources, so that
-			// it can be recycled when not needed anymore.
-			frame.ownedResources.emplace_front( std::move( rp ) );
-		}
-	} // end for each pass
-}
-
 // ----------------------------------------------------------------------
 
 /// \brief fetchVkBuffer from frame local storage based on resource handle flags
@@ -2915,15 +2603,15 @@ static inline VkBuffer frame_data_get_buffer_from_le_resource_id( BackendFrameDa
 		return frame->stagingAllocator->buffers[ buffer->get_idx() ];
 	} else {
 #ifndef NDEBUG
-        auto it_buf = frame->availableResources.find( buffer );
-        if ( it_buf != frame->availableResources.end() ) {
-            return it_buf->second.as.buffer;
-        } else {
+		auto it_buf = frame->availableResources.find( buffer );
+		if ( it_buf != frame->availableResources.end() ) {
+			return it_buf->second.as.buffer;
+		} else {
 			logger().error( "Resource '%s' is not declared in current frame/renderpass.", buffer->get_debug_name() );
 			return nullptr;
 		}
 #else
-        return frame->availableResources.at( buffer ).as.buffer;
+		return frame->availableResources.at( buffer ).as.buffer;
 #endif
 	}
 }
@@ -2940,7 +2628,7 @@ static inline VkFormat frame_data_get_image_format_from_resource_id( BackendFram
 
 // ----------------------------------------------------------------------
 
-static inline AllocatedResourceVk const& frame_data_get_allocated_resource_from_resource_id( BackendFrameData* frame, le_resource_handle const rsp ) {
+static inline AllocatedResourceVk const& frame_data_get_allocated_resource_from_resource_id( BackendFrameData const* frame, le_resource_handle const rsp ) {
 	return frame->availableResources.at( rsp );
 }
 
@@ -2980,92 +2668,150 @@ VkImageAspectFlags get_aspect_flags_from_format( le::Format const& format ) {
 // ----------------------------------------------------------------------
 // Executes on the DISPATCH FRAME
 //
-// input: Pass
-// output: framebuffer, append newly created imageViews to retained resources list.
-static void backend_create_frame_buffers( BackendFrameData& frame, VkDevice& device ) {
+static VkImageView create_image_view_for_attachment( BackendFrameData& frame, VkDevice& device, const AttachmentInfo* attachment ) {
 
+	uint32_t        layer_count     = 1;
+	VkImageViewType image_view_type = VK_IMAGE_VIEW_TYPE_2D;
+
+	if ( attachment->viewMask ) {
+		// If viewMask is set, this means that we are drawing using multiview.
+		// Multiview means that we must draw using Layers. Therefore our image
+		// must be a 2D Array Image.
+		layer_count     = std::popcount( attachment->viewMask );
+		image_view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	}
+
+	VkImageSubresourceRange subresourceRange{
+	    .aspectMask     = get_aspect_flags_from_format( attachment->format ),
+	    .baseMipLevel   = 0,
+	    .levelCount     = 1,
+	    .baseArrayLayer = 0,
+	    .layerCount     = layer_count,
+	};
+
+	VkImage img = frame_data_get_image_from_le_resource_id( &frame, attachment->resource );
+
+	VkImageViewCreateInfo imageViewCreateInfo{
+	    .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .pNext            = nullptr, // optional
+	    .flags            = 0,       // optional
+	    .image            = img,
+	    .viewType         = image_view_type,
+	    .format           = VkFormat( attachment->format ),
+	    .components       = {},
+	    .subresourceRange = subresourceRange,
+	};
+
+	VkImageView image_view = nullptr;
+	{
+		auto result = vkCreateImageView( device, &imageViewCreateInfo, nullptr, &image_view );
+		assert( result == VK_SUCCESS );
+	}
+
+	// Retain imageviews in owned resources - they will be released
+	// once not needed anymore.
+
+	AbstractPhysicalResource iv;
+	iv.type        = AbstractPhysicalResource::eImageView;
+	iv.asImageView = image_view;
+
+	frame.ownedResources.emplace_front( std::move( iv ) );
+
+	return image_view;
+}
+// ----------------------------------------------------------------------
+
+static void backend_create_rendering_attachment_infos( BackendFrameData& frame, VkDevice& device ) {
 	ZoneScoped;
+
+	const auto& syncChainTable = frame.syncChainTable;
+
 	for ( auto& pass : frame.passes ) {
 
+		// The rest of this loop only concerns draw passes
+		//
 		if ( pass.type != le::QueueFlagBits::eGraphics ) {
 			continue;
 		}
 
-		uint32_t attachmentCount = pass.numColorAttachments +
-		                           pass.numResolveAttachments +
-		                           pass.numDepthStencilAttachments;
+		// ---------| Invariant: current pass is a draw pass.
 
-		std::vector<VkImageView> framebufferAttachments;
-		framebufferAttachments.reserve( attachmentCount );
+		auto const attachments_end = pass.attachments.data() +
+		                             pass.numColorAttachments +
+		                             pass.numDepthStencilAttachments
+		    ;
 
-		auto const attachment_end = pass.attachments + attachmentCount;
-		for ( AttachmentInfo const* attachment = pass.attachments; attachment != attachment_end; attachment++ ) {
+		size_t resolve_attachment_count = pass.numResolveAttachments; // if there are resolve attachments, them must be the same size as colour+depth count
 
-			VkImageSubresourceRange subresourceRange{
-			    .aspectMask     = get_aspect_flags_from_format( attachment->format ),
-			    .baseMipLevel   = 0,
-			    .levelCount     = 1,
-			    .baseArrayLayer = 0,
-			    .layerCount     = 1,
-			};
+		// if there are resolve attachments, there must be one for each colour and depth element
+		assert( ( resolve_attachment_count == 0 ) || ( resolve_attachment_count = pass.numColorAttachments + pass.numDepthStencilAttachments ) );
 
-			VkImage img = frame_data_get_image_from_le_resource_id( &frame, attachment->resource );
+		for ( AttachmentInfo const* attachment = pass.attachments.data(); attachment != attachments_end; attachment++ ) {
 
-			VkImageViewCreateInfo imageViewCreateInfo{
-			    .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			    .pNext            = nullptr, // optional
-			    .flags            = 0,       // optional
-			    .image            = img,
-			    .viewType         = VK_IMAGE_VIEW_TYPE_2D,
-			    .format           = VkFormat( attachment->format ),
-			    .components       = {},
-			    .subresourceRange = subresourceRange,
-			};
-
-			VkImageView imageView = nullptr;
-			{
-				auto result = vkCreateImageView( device, &imageViewCreateInfo, nullptr, &imageView );
-				assert( result == VK_SUCCESS );
-			}
-
-			framebufferAttachments.push_back( imageView );
+			VkResolveModeFlagBits resolve_mode =
+			    resolve_attachment_count
+			        ? VK_RESOLVE_MODE_AVERAGE_BIT
+			        : VK_RESOLVE_MODE_NONE;
 
 			{
-				// Retain imageviews in owned resources - they will be released
-				// once not needed anymore.
+				static bool is_stencil_did_warn = false;
+				// store format so that it can be more easily gathered when creating pipelines.
+				bool is_depth, is_stencil;
 
-				AbstractPhysicalResource iv;
-				iv.type        = AbstractPhysicalResource::eImageView;
-				iv.asImageView = imageView;
+				le_format_get_is_depth_stencil( attachment->format, is_depth, is_stencil );
 
-				frame.ownedResources.emplace_front( std::move( iv ) );
+				if ( is_depth || is_stencil ) {
+					pass.depth_format = VkFormat( attachment->format );
+					if ( is_stencil ) {
+						resolve_mode = VK_RESOLVE_MODE_NONE;
+						if ( false == is_stencil_did_warn ) {
+							logger().warn( "Renderpass: '%s'", pass.debugName );
+							logger().warn( "Stencil testing is not implemented currently." );
+							is_stencil_did_warn = true; // we only want to warn once.
+						}
+					}
+				} else {
+					pass.color_formats.push_back( VkFormat( attachment->format ) );
+				}
 			}
+
+			auto& syncChain = syncChainTable.at( attachment->resource );
+
+			const ResourceState& resource_state = syncChain.at( attachment->sync_chain_offset ); // resource state during the renderpass
+
+			VkImageView image_view = create_image_view_for_attachment( frame, device, attachment );
+
+			VkImageView   resolve_image_view   = nullptr;
+			VkImageLayout resolve_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+			if ( resolve_attachment_count ) {
+				auto const resolve_attachment = ( attachment + resolve_attachment_count );
+				resolve_image_view            = create_image_view_for_attachment( frame, device, resolve_attachment );
+				auto const& sc                = syncChainTable.at( resolve_attachment->resource );
+				resolve_image_layout          = sc.at( ( resolve_attachment )->sync_chain_offset ).layout;
+			};
+
+			VkRenderingAttachmentInfo a_i = {
+			    .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, // VkStructureType
+			    .pNext              = nullptr,                                     // void *, optional
+			    .imageView          = image_view,                                  // VkImageView, optional
+			    .imageLayout        = resource_state.layout,                       // VkImageLayout
+			    .resolveMode        = resolve_mode,                                // VkResolveModeFlagBits, optional
+			    .resolveImageView   = resolve_image_view,                          // VkImageView, optional
+			    .resolveImageLayout = resolve_image_layout,                        // VkImageLayout, if image is a resolve image?
+			    .loadOp             = VkAttachmentLoadOp( attachment->loadOp ),
+			    .storeOp            = VkAttachmentStoreOp( attachment->storeOp ),
+			    .clearValue         = reinterpret_cast<VkClearValue const&>( attachment->clearValue ), // VkClearValue
+			};
+
+			// Accumulate any multiview info
+			pass.viewMask |= attachment->viewMask;
+			pass.layer_count = std::max<uint32_t>( pass.layer_count, std::popcount( attachment->viewMask ) );
+			// Store attachment info for vkCmdBeginRenderingg
+			pass.attachment_rendering_infos.emplace_back( std::move( a_i ) );
 		}
 
-		VkFramebufferCreateInfo framebufferCreateInfo{
-		    .sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-		    .pNext           = nullptr, // optional
-		    .flags           = 0,       // optional
-		    .renderPass      = pass.renderPass,
-		    .attachmentCount = attachmentCount, // optional
-		    .pAttachments    = framebufferAttachments.data(),
-		    .width           = pass.width,
-		    .height          = pass.height,
-		    .layers          = 1,
-		};
-
-		auto result = vkCreateFramebuffer( device, &framebufferCreateInfo, nullptr, &pass.framebuffer );
-		assert( result == VK_SUCCESS && "Framebuffer must be valid" );
-		{
-			// Retain framebuffer
-
-			AbstractPhysicalResource fb;
-			fb.type          = AbstractPhysicalResource::eFramebuffer;
-			fb.asFramebuffer = pass.framebuffer;
-
-			frame.ownedResources.emplace_front( std::move( fb ) );
-		}
-	}
+	} // end for each pass
 }
 
 // ----------------------------------------------------------------------
@@ -3253,7 +2999,7 @@ static void backend_destroy_buffer( le_backend_o* self, VkBuffer buffer, VmaAllo
 // ----------------------------------------------------------------------
 // Allocates and creates a physical vulkan resource using vmaAlloc given an allocator
 // Returns an AllocatedResourceVk, currently does not do any error checking.
-static inline AllocatedResourceVk allocate_resource_vk( const VmaAllocator& alloc, const ResourceCreateInfo& resourceInfo_, VkDevice device = nullptr ) {
+static inline AllocatedResourceVk allocate_resource_vk( const VmaAllocator& alloc, const ResourceCreateInfo& resourceInfo_, VkDevice device = nullptr, le_resource_handle maybe_debug_resource = nullptr ) {
 	ZoneScoped;
 	AllocatedResourceVk res{};
 	res.info = resourceInfo_;
@@ -3286,7 +3032,8 @@ static inline AllocatedResourceVk allocate_resource_vk( const VmaAllocator& allo
 		         res.info.imageInfo.extent.width *
 		         res.info.imageInfo.extent.height ) {
 
-			logger().error( "Image cannot be allocated with invalid extents: %dx%dx%d",
+			logger().error( "Image '%s' cannot be allocated with invalid extents: %dx%dx%d",
+			                ( maybe_debug_resource ? maybe_debug_resource->get_debug_name() : "" ),
 			                res.info.imageInfo.extent.depth,
 			                res.info.imageInfo.extent.width,
 			                res.info.imageInfo.extent.height );
@@ -4256,7 +4003,7 @@ static void backend_allocate_resources( le_backend_o* self, BackendFrameData& fr
 					}
 				}
 
-				auto allocatedResource = allocate_resource_vk( self->mAllocator, resourceCreateInfo, self->device->getVkDevice() );
+				auto allocatedResource = allocate_resource_vk( self->mAllocator, resourceCreateInfo, self->device->getVkDevice(), resource );
 
 				if ( LE_PRINT_DEBUG_MESSAGES || true ) {
 					printResourceInfo( resource, allocatedResource.info, "ALLOC" );
@@ -4398,11 +4145,12 @@ static void backend_allocate_resources( le_backend_o* self, BackendFrameData& fr
 				               r.second.as.buffer );
 				break;
 			case ( LeResourceType::eImage ):
-				logger().info( "%10s : %36s@%d : %30p",
+				logger().info( "%10s : %36s@%d : %30p : %s",
 				               "Image",
 				               r.first->get_debug_name(),
 				               1 << static_cast<le_image_resource_handle>( r.first )->get_num_samples(),
-				               r.second.as.buffer );
+				               r.second.as.image,
+				               to_str_vk_image_layout( r.second.state.layout ) );
 				break;
 			case ( LeResourceType::eRtxBlas ):
 				logger().info( "%10s : %36s@%d",
@@ -4572,7 +4320,10 @@ static void frame_allocate_transient_resources( BackendFrameData& frame, VkDevic
 				auto& texInfo = textureInfos[ i ];
 
 				// -- Store Texture with frame so that decoder can find references
-				BackendFrameData::Texture tex;
+				BackendFrameData::Texture tex = {};
+
+				// used for debug only
+				tex.debug_parent_image_handle = texInfo.imageView.imageId;
 
 				auto const& imageFormat = le::Format( frame_data_get_image_format_from_image_view_info( &frame, &texInfo.imageView ) );
 				{
@@ -4581,9 +4332,9 @@ static void frame_allocate_transient_resources( BackendFrameData& frame, VkDevic
 					VkImageSubresourceRange subresourceRange{
 					    .aspectMask     = get_aspect_flags_from_format( imageFormat ),
 					    .baseMipLevel   = 0,
-					    .levelCount     = VK_REMAINING_MIP_LEVELS, // we set VK_REMAINING_MIP_LEVELS which activates all mip levels remaining.
+					    .levelCount     = VK_REMAINING_MIP_LEVELS, // we set VK_REMAINING_MIP_LEVELS, which activates all mip levels remaining.
 					    .baseArrayLayer = texInfo.imageView.base_array_layer,
-					    .layerCount     = VK_REMAINING_ARRAY_LAYERS, // Fixme: texInfo.imageView.layer_count must be 6 if imageView.type is cubemap
+					    .layerCount     = texInfo.imageView.layer_count, // Note: texInfo.imageView.layer_count must be 6 if imageView.type is cubemap
 					};
 
 					VkImageViewCreateInfo imageViewCreateInfo = {
@@ -5352,23 +5103,24 @@ static bool backend_acquire_physical_resources( le_backend_o*             self,
 		    DEFAULT_RENDERPASS_HEIGHT );
 	}
 
-	// Note: this consumes frame.declared_resources
-	// Note: this will taint any bindless (sub)resources that are affected by resources that are allocated or re-allocated.
+	// Note: This consumes frame.declared_resources
+	// Note: This will taint any bindless (sub)resources that are affected by resources that are allocated or re-allocated.
 	backend_allocate_resources( self, frame, passes, numRenderPasses );
 
 	{
-		// Initialise, then build sync chain table - each resource receives initial state
-		// from current entry in frame.availableResources resource map -
-
-		assert( frame.explicit_sync_requests.empty() );
 		assert( frame.syncChainTable.empty() );
 
+		// Pre-Initialise SyncChain table:
+		//
+		// - set initial state by looking at available resources and by picking
+		//   the state of that resource at the end of the previous frame.
+
 		for ( auto const& res : frame.availableResources ) {
+			std::string name  = res.first->get_debug_name();
+			auto&       state = res.second.state;
 			frame.syncChainTable.insert( { res.first, { res.second.state } } );
 		}
 
-		// -- build sync chain for each resource, create explicit sync barrier requests for resources
-		// which cannot be implicitly synced.
 		std::vector<le_image_resource_handle> tmp_swapchain_resources{};
 		tmp_swapchain_resources.reserve( frame.frame_owned_swapchain_state.size() );
 
@@ -5378,13 +5130,12 @@ static bool backend_acquire_physical_resources( le_backend_o*             self,
 
 		frame_track_resource_state( frame, passes, numRenderPasses, tmp_swapchain_resources, self->renderer );
 
-		// At this point we know the state for each resource at the end of the sync chain.
-		// this state will be the initial state for the resource
-
+		// At this point we know the final state for each resource at the end of the sync chain.
+		// So that we can initialize the sync chain table again for the next frame, we store the last
+		// state for each known resource with the backend.
+		//
 		{
 			// Update final sync state for each pre-existing backend resource.
-			// fixme: this breaks the promise that no-one but allocate resources is writing to allocatedResources.
-
 
 			auto [ backend_resources, lock ] = self->get_allocated_resources();
 
@@ -5400,6 +5151,9 @@ static bool backend_acquire_physical_resources( le_backend_o*             self,
 				if ( res != backend_resources.end() ) {
 					// Element found.
 					// Set sync state for this resource to value of last elment in the sync chain.
+					le_resource_handle handle         = res->first;
+					auto&              resource_state = res->second;
+					std::string        res_name       = handle->get_debug_name();
 					res->second.state = resSyncList.back();
 				} else {
 
@@ -5434,16 +5188,11 @@ static bool backend_acquire_physical_resources( le_backend_o*             self,
 	                                   self->mFrames[ previous_frame_index ].bindless_samplers_descriptor_set,
 	                                   self->mFrames[ previous_frame_index ].bindless_storage_images_descriptor_set );
 
-	// create renderpasses - use sync chain to apply implicit syncing for image attachment resources
-	backend_create_renderpasses( frame, device );
+	// Create attachment infos that can then be used to begin rendering
+	backend_create_rendering_attachment_infos( frame, device );
 
 	// -- make sure that there is a descriptorpool for every renderpass
 	backend_create_descriptor_pools( frame, device, numRenderPasses );
-
-	// patch and retain physical resources in bulk here, so that
-	// each pass may be processed independently
-
-	backend_create_frame_buffers( frame, device );
 
 	return true;
 };
@@ -6202,82 +5951,162 @@ inline DescriptorData* find_descriptor_with_binding_number_and_array_idx(
 }
 
 // ----------------------------------------------------------------------
-static void pass_insert_explicit_sync_ops( BackendFrameData const& frame, BackendFrameData::PerQueueSubmissionData const& submission, std::vector<ExplicitSyncOp> const& explicit_sync_ops, VkCommandBuffer& cmd ) {
+static void cmd_insert_pipeline_barriers( VkCommandBuffer& cmd, BackendFrameData const& frame, BackendFrameData::PerQueueSubmissionData const& submission, std::vector<ExplicitSyncOp> const& explicit_sync_ops ) {
 	ZoneScoped;
 
 	// -- Issue sync barriers for all resources which require explicit sync.
+	// -- Note that these resources may be buffers as well as images...
 	//
 	// The spec requires barriers to happen outside of a Renderpass context.
-	//
+
+	std::vector<VkImageMemoryBarrier2>  image_barriers;
+	std::vector<VkBufferMemoryBarrier2> buffer_barriers;
+
 	for ( auto const& op : explicit_sync_ops ) {
 		// fill in sync op
-
-		if ( op.active == false ) {
-			continue;
-		}
-
-		// ---------| invariant: barrier is active.
 
 		auto const& syncChain = frame.syncChainTable.at( op.resource );
 
 		auto const& stateInitial = syncChain[ op.sync_chain_offset_initial ];
 		auto const& stateFinal   = syncChain[ op.sync_chain_offset_final ];
 
-		if ( stateInitial != stateFinal ) {
-			// we must issue an image barrier
-
+		auto print_debug_messages = [ & ]() {
 			if ( LE_PRINT_DEBUG_MESSAGES ) {
 
-				// --------| invariant: barrier is active.
-
 				// print out sync chain for sampled image
-				logger().info( "\t Explicit Barrier for: %s (s: %d)", op.resource->get_debug_name(), 1 << static_cast<le_image_resource_handle>( op.resource )->get_num_samples() );
-				logger().info( "\t % 3s : % 30s : % 30s : % 10s", "#", "visible_access", "write_stage", "layout" );
-				logger().info( "\t --- : ------------------------------ : ------------------------------ : ----------" );
-
-				auto const& syncChain = frame.syncChainTable.at( op.resource );
-
-				for ( size_t i = op.sync_chain_offset_initial; i <= op.sync_chain_offset_final; i++ ) {
-					auto const& s = syncChain[ i ];
-					logger().info( "\t % 3d : % 30s : % 30s : % 10s", i,
-					               to_string_vk_access_flags2( s.visible_access ).c_str(),
-					               to_string_vk_pipeline_stage_flags2( s.stage ).c_str(),
-					               to_str_vk_image_layout( s.layout ) );
+				if ( op.resource->get_type() == le::ResourceType::eImage ) {
+					logger().info( "\t Explicit Image Barrier for: %s (s: %d)", op.resource->get_debug_name(), 1 << static_cast<le_image_resource_handle>( op.resource )->get_num_samples() );
+					logger().info( "\t % 3s : % 30s : % 30s : % 10s", "#", "visible_access", "write_stage", "layout" );
+					logger().info( "\t --- : ------------------------------ : ------------------------------ : ----------" );
+					logger().info( "\t % 3d : % 30s : % 30s : % 10s", op.sync_chain_offset_initial,
+					               to_string_vk_access_flags2( stateInitial.visible_access ).c_str(),
+					               to_string_vk_pipeline_stage_flags2( stateInitial.stage ).c_str(),
+					               to_str_vk_image_layout( stateInitial.layout ) );
+					logger().info( "\t % 3d : % 30s : % 30s : % 10s", op.sync_chain_offset_final,
+					               to_string_vk_access_flags2( stateFinal.visible_access ).c_str(),
+					               to_string_vk_pipeline_stage_flags2( stateFinal.stage ).c_str(),
+					               to_str_vk_image_layout( stateFinal.layout ) );
+				} else if ( op.resource->get_type() == le::ResourceType::eBuffer ) {
+					logger().info( "\t Explicit Buffer Barrier for: %s", op.resource->get_debug_name() );
+					logger().info( "\t % 3s : % 30s : % 30s ", "#", "visible_access", "write_stage" );
+					logger().info( "\t --- : ------------------------------ : ------------------------------ " );
+					logger().info( "\t % 3d : % 30s : % 30s", op.sync_chain_offset_initial,
+					               to_string_vk_access_flags2( stateInitial.visible_access ).c_str(),
+					               to_string_vk_pipeline_stage_flags2( stateInitial.stage ).c_str() );
+					logger().info( "\t % 3d : % 30s : % 30s", op.sync_chain_offset_final,
+					               to_string_vk_access_flags2( stateFinal.visible_access ).c_str(),
+					               to_string_vk_pipeline_stage_flags2( stateFinal.stage ).c_str() );
+				} else {
+					logger().warn( "Unknown resource type: %d for resource name: '%s'", op.resource->get_type(), op.resource->get_debug_name() );
 				}
 			}
+		};
 
-			auto dstImage = frame_data_get_image_from_le_resource_id( &frame, static_cast<le_image_resource_handle>( op.resource ) );
+		if ( stateInitial != stateFinal ) {
 
-			VkImageMemoryBarrier2 imageLayoutTransfer{
-			    .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-			    .pNext               = nullptr,
-			    .srcStageMask        = uint64_t( stateInitial.stage ) == 0 ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : stateInitial.stage, // happens-before
-			    .srcAccessMask       = ( stateInitial.visible_access & ANY_WRITE_VK_ACCESS_2_FLAGS ),                                  // make available memory update from operation (in case it was a write operation, otherwise don't wait)
-			    .dstStageMask        = stateFinal.stage,                                                                               // happens-after
-			    .dstAccessMask       = stateFinal.visible_access,                                                                      // make visible
-			    .oldLayout           = stateInitial.layout,
-			    .newLayout           = stateFinal.layout,
-			    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-			    .image               = dstImage,
-			    .subresourceRange    = LE_IMAGE_SUBRESOURCE_RANGE_ALL_MIPLEVELS,
-			};
+			switch ( op.resource->get_type() ) {
 
-			VkDependencyInfo dependencyInfo = {
-			    .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-			    .pNext                    = nullptr, // optional
-			    .dependencyFlags          = 0,       // optional
-			    .memoryBarrierCount       = 0,       // optional
-			    .pMemoryBarriers          = 0,
-			    .bufferMemoryBarrierCount = 0, // optional
-			    .pBufferMemoryBarriers    = 0,
-			    .imageMemoryBarrierCount  = 1, // optional
-			    .pImageMemoryBarriers     = &imageLayoutTransfer,
-			};
+			case ( le::ResourceType::eImage ): {
 
-			vkCmdPipelineBarrier2( cmd, &dependencyInfo );
+				auto img_info = frame_data_get_allocated_resource_from_resource_id( &frame, op.resource );
+
+				VkImageMemoryBarrier2 i_barrier{
+				    .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+				    .pNext               = nullptr,
+				    .srcStageMask        = uint64_t( stateInitial.stage ) == 0 ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : stateInitial.stage, // happens-before
+				    .srcAccessMask       = ( stateInitial.visible_access ),                                                                // make available memory update from operation (in case it was a write operation, otherwise don't wait)
+				    .dstStageMask        = stateFinal.stage,                                                                               // happens-after
+				    .dstAccessMask       = stateFinal.visible_access,                                                                      // make visible
+				    .oldLayout           = stateInitial.layout,
+				    .newLayout           = stateFinal.layout,
+				    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				    .image               = img_info.as.image,
+				    .subresourceRange    = LE_IMAGE_SUBRESOURCE_RANGE_ALL_MIPLEVELS,
+				};
+
+				i_barrier.subresourceRange.aspectMask = get_aspect_flags_from_format( le::Format( img_info.info.imageInfo.format ) );
+
+				// We only want to issue barrier if there is actual work to do -
+				// This means there needs to be either:
+				// 1) a layout transition
+				// 2) a write operation in srcAccessMask that needs to be flushed (made available)
+
+				if ( i_barrier.oldLayout != i_barrier.newLayout || i_barrier.srcAccessMask & ANY_WRITE_VK_ACCESS_2_FLAGS ) {
+					image_barriers.emplace_back( std::move( i_barrier ) );
+					print_debug_messages();
+				}
+				break;
+			}
+			case ( le::ResourceType::eBuffer ): {
+
+				auto buf_info = frame_data_get_allocated_resource_from_resource_id( &frame, op.resource );
+
+				VkBufferMemoryBarrier2 b_barrier{
+				    .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,                                                      // VkStructureType
+				    .pNext               = nullptr,                                                                                        // void *, optional
+				    .srcStageMask        = uint64_t( stateInitial.stage ) == 0 ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : stateInitial.stage, // happens-before
+				    .srcAccessMask       = ( stateInitial.visible_access ),                                                                // make available memory update from operation (in case it was a write operation, otherwise don't wait)
+				    .dstStageMask        = stateFinal.stage,                                                                               // happens-after
+				    .dstAccessMask       = stateFinal.visible_access,                                                                      // make visible
+				    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,                                                                        // uint32_t
+				    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,                                                                        // uint32_t
+				    .buffer              = buf_info.as.buffer,                                                                             // VkBuffer
+				    .offset              = 0,                                                                                              // VkDeviceSize :: we don't do sub-allocations per-buffer, therefore all our buffers have offset 0
+				    .size                = buf_info.info.bufferInfo.size,                                                                  // VkDeviceSize
+				};
+
+				buffer_barriers.emplace_back( b_barrier );
+				print_debug_messages();
+				break;
+			}
+			default:
+				assert( false ); // unexpected resource type
+			}
 		}
 	} // end for all explicit sync ops.
+
+	VkMemoryBarrier2 batched_buffer_barriers{
+	    .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, // VkStructureType
+	    .pNext         = nullptr,                            // void *, optional
+	    .srcStageMask  = 0,                                  // VkPipelineStageFlags2, optional
+	    .srcAccessMask = 0,                                  // VkAccessFlags2, optional
+	    .dstStageMask  = 0,                                  // VkPipelineStageFlags2, optional
+	    .dstAccessMask = 0,                                  // VkAccessFlags2, optional
+	};
+
+	for ( auto& b : buffer_barriers ) {
+		batched_buffer_barriers.srcStageMask |= b.srcStageMask;
+		batched_buffer_barriers.srcAccessMask |= b.srcAccessMask;
+		batched_buffer_barriers.dstStageMask |= b.dstStageMask;
+		batched_buffer_barriers.dstAccessMask |= b.dstAccessMask;
+	}
+
+	/*
+	 * Note that for buffer barriers, we don't issue the individual barriers, but
+	 * we batch them by accumulating all buffer barriers into a single global
+	 * memory barrier that is the superset of all barrier sync ops.
+	 *
+	 * This is the suggested way to do it according to:
+	 * <https://github.com/KhronosGroup/Vulkan-Docs/wiki/Synchronization-Examples>
+	 *
+	 * It appears per-buffer barriers are mainly useful for transferring queue family
+	 * ownership for a buffer resource.
+	 *
+	 */
+
+	VkDependencyInfo dependencyInfo = {
+	    .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+	    .pNext                    = nullptr, // optional
+	    .dependencyFlags          = 0,       // optional
+	    .memoryBarrierCount       = 1,       // optional
+	    .pMemoryBarriers          = &batched_buffer_barriers,
+	    .bufferMemoryBarrierCount = 0,                                 // uint32_t( buffer_barriers.size() ), // optional
+	    .pBufferMemoryBarriers    = nullptr,                           // buffer_barriers.data(),
+	    .imageMemoryBarrierCount  = uint32_t( image_barriers.size() ), // optional
+	    .pImageMemoryBarriers     = image_barriers.data(),
+	};
+	vkCmdPipelineBarrier2( cmd, &dependencyInfo );
 }
 
 // ----------------------------------------------------------------------
@@ -6636,37 +6465,42 @@ static void backend_process_frame( le_backend_o* self, size_t frameIndex ) {
 			}
 
 			if ( LE_PRINT_DEBUG_MESSAGES ) {
-				logger().info( "*** Frame %d *** Queue %d *** Renderpass '%s'", frame.frameNumber, submission.queue_idx, pass.debugName );
+				logger().info( "*** Frame %d *** Queue %d *** / Begin Renderpass '%s'", frame.frameNumber, submission.queue_idx, pass.debugName );
 			}
-			pass_insert_explicit_sync_ops( frame, submission, pass.sync_ops_before_pass, cmd );
+
+			cmd_insert_pipeline_barriers( cmd, frame, submission, pass.sync_ops_before_pass );
+
+			if constexpr ( LE_PRINT_DEBUG_MESSAGES ) {
+				logger().info( "--- / End Sync before pass " );
+			}
 
 			// Draw passes must begin by opening a Renderpass context.
-			if ( pass.type == le::QueueFlagBits::eGraphics && pass.renderPass ) {
+			if ( pass.type == le::QueueFlagBits::eGraphics ) {
 
-				for ( uint32_t i = 0; i != ( pass.numColorAttachments + pass.numDepthStencilAttachments ); ++i ) {
-					clearValues[ i ] = reinterpret_cast<VkClearValue&>( pass.attachments[ i ].clearValue );
-				}
-
-				VkRenderPassBeginInfo renderPassBeginInfo{
-				    .sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-				    .pNext       = nullptr, // optional
-				    .renderPass  = pass.renderPass,
-				    .framebuffer = pass.framebuffer,
-				    .renderArea  = {
-				         .offset = { 0, 0 },
-				         .extent = { pass.width, pass.height },
-                    },
-				    .clearValueCount = uint32_t( pass.numColorAttachments + pass.numDepthStencilAttachments ), // optional
-				    .pClearValues    = clearValues.data(),
+				VkRenderingInfo rendering_info = {
+				    .sType      = VK_STRUCTURE_TYPE_RENDERING_INFO, // VkStructureType
+				    .pNext      = nullptr,                          // void *, optional
+				    .flags      = 0,                                // VkRenderingFlags, optional
+				    .renderArea = {
+				        .offset = { 0, 0 },
+				        .extent = { pass.width, pass.height },
+				    },
+				    .layerCount           = std::max<uint32_t>( 1, pass.layer_count ),                                                                     // uint32_t  --
+				    .viewMask             = pass.viewMask,                                                                                                 // uint32_t  -- for multi-view rendering
+				    .colorAttachmentCount = pass.numColorAttachments,                                                                                      // uint32_t, optional
+				    .pColorAttachments    = pass.attachment_rendering_infos.data(),                                                                        // VkRenderingAttachmentInfo const *
+				    .pDepthAttachment     = pass.numDepthStencilAttachments ? pass.attachment_rendering_infos.data() + pass.numColorAttachments : nullptr, // VkRenderingAttachmentInfo const *, optional
+				    // TODO: we need to account for separate stencil attachment
+				    .pStencilAttachment = nullptr, // VkRenderingAttachmentInfo const *, optional
 				};
 
-				vkCmdBeginRenderPass( cmd, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE );
+				vkCmdBeginRendering( cmd, &rendering_info );
+
 			}
 
 			// -- Translate intermediary command stream data to api-native instructions
 
 			size_t   commandIndex  = 0;
-			uint32_t subpassIndex  = 0;
 
 			VkPipelineLayout currentPipelineLayout                          = nullptr;
 			VkDescriptorSet  descriptorSets[ LE_MAX_BOUND_DESCRIPTOR_SETS ] = {}; // currently bound descriptorSets (allocated from pool, therefore we must not worry about freeing, and may re-use freely)
@@ -6726,7 +6560,7 @@ static void backend_process_frame( le_backend_o* self, size_t frameIndex ) {
 
 							using namespace le_backend_vk;
 							// -- potentially compile and create pipeline here, based on current pass and subpass
-							auto requestedPipeline = le_pipeline_manager_i.produce_graphics_pipeline( pipelineManager, le_cmd->info.gpsoHandle, pass, subpassIndex );
+							auto requestedPipeline = le_pipeline_manager_i.produce_graphics_pipeline( pipelineManager, le_cmd->info.gpsoHandle, pass );
 
 							if ( /* DISABLES CODE */ ( false ) ) {
 								// Print pipeline debug info when a new pipeline gets bound.
@@ -7477,6 +7311,22 @@ static void backend_process_frame( le_backend_o* self, size_t frameIndex ) {
 
 							bindingData->imageInfo.sampler     = foundTex->second.sampler;
 							bindingData->imageInfo.imageView   = foundTex->second.imageView;
+
+							// print binding debug info about image here.
+							if constexpr ( LE_PRINT_DEBUG_MESSAGES ) {
+
+								char const* const tex_name = le_get_argument_name_from_hash( argument_name_id );
+								char const* const img_name = foundTex->second.debug_parent_image_handle->get_debug_name();
+
+								logger().info( "    Bind image '% -30s' to texture '% -30s', at %d:%d[%d]; layout: %s",
+								               img_name,
+								               tex_name,
+								               b->setIndex,
+								               b->binding,
+								               arrayIndex,
+								               to_str_vk_image_layout( VkImageLayout( bindingData->imageInfo.imageLayout ) ) );
+							}
+
 						} else {
 							logger().error( "Could not find texture binding at set: %d, binding: %d, array index: %d.", b->setIndex, b->binding, arrayIndex );
 							assert( bindingData && "could not find specified binding." );
@@ -8246,6 +8096,30 @@ static void backend_process_frame( le_backend_o* self, size_t frameIndex ) {
 
 						break;
 					}
+					case le::CommandType::eDebugMessage: {
+						// Debug messages are only evaluated if the application is running in debug mode,
+						// Otherwise they are silently ignored.
+#ifndef NDEBUG
+						auto*       le_cmd = static_cast<le::CommandDebugMessage*>( dataIt );
+						std::string message{ ( char* )( le_cmd + 1 ), ( char* )( le_cmd + 1 ) + le_cmd->info.num_bytes };
+						switch ( le_cmd->info.priority ) {
+						case 0:
+							logger().debug( message.c_str() );
+							break;
+						case 1:
+							logger().info( message.c_str() );
+							break;
+						case 2:
+							logger().warn( message.c_str() );
+							break;
+						case 3: // deliberate fall-through
+						default:
+							logger().error( message.c_str() );
+							break;
+						}
+#endif
+						break;
+					}
 					default: {
 						assert( false && "command not handled" );
 					}
@@ -8260,35 +8134,25 @@ static void backend_process_frame( le_backend_o* self, size_t frameIndex ) {
 			}
 
 			// non-draw passes don't need renderpasses.
-			if ( pass.type == le::QueueFlagBits::eGraphics && pass.renderPass ) {
-				vkCmdEndRenderPass( cmd );
+			if ( pass.type == le::QueueFlagBits::eGraphics ) {
+				vkCmdEndRendering( cmd );
 			}
 
-			if ( LE_PRINT_DEBUG_MESSAGES ) {
-				logger().info( "*** Frame %d *** Queue %d *** EndRenderpass '%s'", frame.frameNumber, submission.queue_idx, pass.debugName );
+			if constexpr ( LE_PRINT_DEBUG_MESSAGES ) {
+				logger().info( "*** Frame %d *** Queue %d *** \\ End   Renderpass '%s'", frame.frameNumber, submission.queue_idx, pass.debugName );
 			}
-			pass_insert_explicit_sync_ops( frame, submission, pass.sync_ops_after_pass, cmd );
+
+			cmd_insert_pipeline_barriers( cmd, frame, submission, pass.sync_ops_after_pass );
+
+			if constexpr ( LE_PRINT_DEBUG_MESSAGES ) {
+				logger().info( "--- / End Sync after pass " );
+			}
 
 			if ( SHOULD_INSERT_DEBUG_LABELS ) {
 				vkCmdEndDebugUtilsLabelEXT( cmd );
 			}
 
 			vkEndCommandBuffer( cmd );
-		}
-		{
-			// TODO: we need to add an explicit layout transition here post renderpasses -
-			// into another renderpass, and which are now
-			// in the wrong layout -- this needs to happen after the last
-			// renderpass is done with this resource. maybe we need to do
-			// this in its own renderpass...
-
-			// if the last transition for an image was not the end of its synch chain?
-			// we would know this when / where we add the renderpasses.
-
-			// ideally, this happens earlier, and the last renderpass
-			// that uses a resource issues translates it back
-			// -- for this we would need to find out which renderpass
-			// did last use a resource...
 		}
 	}
 }

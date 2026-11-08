@@ -85,18 +85,33 @@ static void renderpass_set_setup_callback( le_renderpass_o* self, void* user_dat
 	self->setup_callback_user_data = user_data;
 	self->callbackSetup            = callback;
 }
+// ----------------------------------------------------------------------
+
+static void renderpass_set_cleanup_callback( le_renderpass_o* self, void* user_data, le_renderer_api::pfn_renderpass_cleanup_t callback ) {
+	self->cleanup_callback_user_data = user_data;
+	self->callbackCleanup            = callback;
+}
 
 // ----------------------------------------------------------------------
 
 static void renderpass_set_execute_callback( le_renderpass_o* self, void* user_data, le_renderer_api::pfn_renderpass_execute_t callback ) {
 	self->executeCallbacks.push_back( { callback, user_data } );
 }
+// ----------------------------------------------------------------------
+
+static void renderpass_set_execute_callback_with_local_user_data( le_renderpass_o* self, void* user_data, size_t user_data_num_bytes, le_renderer_api::pfn_renderpass_execute_t callback ) {
+	self->executeCallbacks.push_back( { callback, nullptr, { ( uint8_t* )( user_data ), ( uint8_t* )( user_data ) + user_data_num_bytes } } );
+}
 
 // ----------------------------------------------------------------------
 static void renderpass_run_execute_callbacks( le_renderpass_o* self, le_command_buffer_encoder_o* encoder ) {
 	ZoneScoped;
 	for ( auto const& c : self->executeCallbacks ) {
-		c.fn( encoder, c.user_data );
+		if ( c.local_storage.empty() ) {
+			c.fn( encoder, c.user_data );
+		} else {
+			c.fn( encoder, ( void* )( c.local_storage.data() ) );
+		}
 	}
 }
 
@@ -109,6 +124,15 @@ static bool renderpass_run_setup_callback( le_renderpass_o* self ) {
 }
 
 // ----------------------------------------------------------------------
+static inline void renderpass_run_cleanup_callback( le_renderpass_o* self ) {
+	ZoneScoped;
+	if ( self->callbackCleanup ) {
+		self->callbackCleanup( self->cleanup_callback_user_data );
+		self->callbackCleanup = nullptr; // remove cleanup callback so that it cannot be called again
+	};
+}
+
+// ----------------------------------------------------------------------
 template <typename T>
 static inline bool vector_contains( const std::vector<T>& haystack, const T& needle ) noexcept {
 	return haystack.end() != std::find( haystack.begin(), haystack.end(), needle );
@@ -116,7 +140,6 @@ static inline bool vector_contains( const std::vector<T>& haystack, const T& nee
 
 static inline bool resource_is_a_swapchain_handle( const le_image_resource_handle& handle ) {
 	return handle->get_is_root();
-	// return handle->data->flags == le_img_resource_usage_flags_t::eIsRoot;
 }
 
 // ----------------------------------------------------------------------
@@ -192,29 +215,7 @@ static void renderpass_use_resource( le_renderpass_o* self, const le_resource_ha
 		}
 	}
 
-	// le::Log( LOGGER_LABEL ).info( "pass: [ %20s ] use resource: %40s, access { %-60s }", self->debug_name.c_str(), resource_id->data->debug_name, to_string_le_access_flags2( access_flags ).c_str() );
-
-	// bool detectRead  = bool( access_flags & LE_ALL_READ_ACCESS_FLAGS );
-	bool detectWrite = bool( access_flags & LE_ALL_WRITE_ACCESS_FLAGS );
-
-	// In case we have an IMAGE resource, we might have to do an image layout transform, which is a read/write operation -
-	// this means that some reads to image resources are implicit read/writes.
-	// we can only get rid of this if we can prove that resources will not undergo a layout transform.
-	//
-	if ( resource_id->get_type() == LeResourceType::eImage ) {
-		detectWrite |= bool( access_flags & LE_ALL_IMAGE_IMPLIED_WRITE_ACCESS_FLAGS );
-	}
-
-	// update access flags
-
-	if ( detectWrite ) {
-
-		if ( resource_id->get_type() == LeResourceType::eImage &&
-		     resource_is_a_swapchain_handle( static_cast<le_image_resource_handle>( resource_id ) ) ) {
-			// A request to write to swapchain image automatically turns a pass into a root pass.
-			self->is_root = true;
-		}
-	}
+	// le::Log( LOGGER_LABEL ).info( "pass: [ %20s ] use resource: %40s, access { %-60s }", self->debug_name.c_str(), resource_id->get_debug_name(), to_string_le_access_flags2( access_flags ).c_str() );
 }
 
 
@@ -317,6 +318,10 @@ static void renderpass_set_height( le_renderpass_o* self, uint32_t height ) {
 
 static void renderpass_set_sample_count( le_renderpass_o* self, le::SampleCountFlagBits const& sampleCount ) {
 	self->sample_count = sampleCount;
+}
+
+static le::SampleCountFlagBits renderpass_get_sample_count( le_renderpass_o* self ) {
+	return self->sample_count;
 }
 
 // ----------------------------------------------------------------------
@@ -773,32 +778,47 @@ static void rendergraph_build( le_rendergraph_o* self, size_t frame_number ) {
 	static auto logger = LeLog( LOGGER_LABEL );
 
 	static auto RENDERGRAPH_SHOULD_PRINT_EXTENDED_DEBUG_MESSAGES = LE_SETTING( bool, LE_SETTING_IDENTIFIER_SHOULD_PRINT_EXTENDED_DEBUG_MESSAGES, false );
+
 	// We must express our list of passes as a list of nodes.
 	// A node holds two bitfields, the bitfield names are: `read` and `write`.
 	// Each bit in the bitfield represents a possible resource.
 	// This means we must create a list of unique resources, so that we can use the resource index as the
 	// offset value for a bit representing this particular resource in the bitfields.
 
-	self->nodes.clear();
-
 	self->root_passes_affinity_masks.clear();
 	self->root_debug_names.clear();
 	self->unique_resources.clear();
 
-	auto& nodes                = self->nodes; // There is exactly one Node per `pass` - their indices correspond
+	size_t const num_passes = self->passes.size();
+
+	auto& nodes = self->nodes;
+	nodes.resize( num_passes, {} ); // There is exactly one Node per `pass` - their indices correspond
+
 	auto& known_unique_handles = self->unique_resources;
 
 	self->unique_resources.reserve( LE_MAX_NUM_GRAPH_RESOURCES );
 
 	// Translate all passes into a node
-	//   Get list of resources per pass and build node from this
+	//   Get list of resources per pass and build nodes from this
 
-	uint64_t node_unique_id = 0;
-
-	for ( auto const& p : self->passes ) {
-
-		Node node{};
-		node.unique_id = ++node_unique_id;
+	// ----------------------------------------------------------------------
+	// Note that we iterate BACK-TO-FRONT:
+	//
+	// This allows us to tag the node that LAST uses any swapchain resource
+	// as a root node.
+	//
+	// How does it work? Because we are going BACK-TO-FRONT the
+	// (chronologically) last use of an image resource becomes the first time we
+	// encounter the image resource when going back-to-front. Anytime we encounter
+	// a new image resource, we test it against being a swapchain resource. If it
+	// is, then we mark the container node as a root node, as this is the last
+	// (chronological) use of this swapchain resource.
+	// ----------------------------------------------------------------------
+	//
+	for ( int n_idx = num_passes - 1; n_idx >= 0; n_idx-- ) {
+		auto const& p    = self->passes.at( n_idx );
+		auto&       node = nodes.at( n_idx );
+		node.unique_id   = n_idx;
 
 		const size_t resources_per_pass_count = p->resources.size();
 
@@ -831,6 +851,15 @@ static void rendergraph_build( le_rendergraph_o* self, size_t frame_number ) {
 				if ( res_idx == known_unique_handles.size() ) {
 					// resource was not found, we must add a new resource
 					known_unique_handles.push_back( resource_handle );
+
+					if ( resource_handle->get_type() == le::ResourceType::eImage ) {
+						auto const img_h = ( le_image_resource_handle& )resource_handle;
+						if ( img_h->get_is_root() ) {
+							// last use for this swapchain image : test what happens if you write and read, then read again
+							node.is_root = true;
+						}
+					}
+
 					assert( known_unique_handles.size() < LE_MAX_NUM_GRAPH_RESOURCES && "bitfield must be large enough to provide one field for each unique resource" );
 				}
 
@@ -841,23 +870,22 @@ static void rendergraph_build( le_rendergraph_o* self, size_t frame_number ) {
 				node.explicit_writes.set( res_idx, detect_explicit_write );
 			}
 
+			// if the pass was explicitly declared a root pass, we unconditionally set this root
 			if ( p->is_root ) {
 				node.is_root = true;
 			}
 		}
 		node.debug_name = p->debug_name;
-		nodes.emplace_back( std::move( node ) );
 	}
 
 	// Tag all nodes which contribute to any root node.
 	//
-	// Tasks which don't contribute to any root node
+	// Nodes which don't contribute to any root node
 	// can be disposed, as their products will never be used.
 	uint32_t root_count = 0; // gets set to number of found root nodes as a side-effect of node_tag_contributing
 	node_tag_contributing( nodes.data(), nodes.size(), &root_count );
 
 	// table from pass idx (owner) to owned passes
-	// std::vector<std::vector<uint32_t>> const & grouped_passes_per_pass = self->grouped_passses_per_pass;
 	{
 
 		// If a node is owned by a group owner node that is contributing,
@@ -866,13 +894,13 @@ static void rendergraph_build( le_rendergraph_o* self, size_t frame_number ) {
 		for ( size_t i = 0; i != self->grouped_passes_per_pass.size(); i++ ) {
 			auto const& g = self->grouped_passes_per_pass[ i ];
 
-			if ( !g.empty() && self->nodes[ i ].is_contributing ) {
+			if ( !g.empty() && nodes[ i ].is_contributing ) {
 
 				// All nodes belonging to a group owner node need to
 				// contribute if the group owner is contributing.
 
 				for ( auto const& e : g ) {
-					self->nodes[ e ].is_contributing |= true;
+					nodes[ e ].is_contributing |= true;
 				}
 			}
 		}
@@ -1139,11 +1167,6 @@ static void rendergraph_execute( le_rendergraph_o* self, size_t frameIndex, le_b
 
 	le_pipeline_manager_o* pipelineCache = vk_backend_i.get_pipeline_cache( backend ); // TODO: make pipeline cache either pass- or frame- local
 
-	// Grab main swapchain dimensions so that we may use these as defaults for
-	// encoder extents if these cannot be initialised via renderpass extents.
-	//
-	// Note that this does not change the renderpass extents.
-	// le::Extent2D swapchain_extent{};
 
 	uint32_t num_swapchain_images = 1; // gets updated as a side-effect of backend_i.get_swapchain_info()
 
@@ -1156,6 +1179,8 @@ static void rendergraph_execute( le_rendergraph_o* self, size_t frameIndex, le_b
 		swapchain_image_height.resize( num_swapchain_images );
 		swapchain_image_width.resize( num_swapchain_images );
 	} while ( false ==
+	          // Grab dimensions for any swapchains so that we may use these as defaults for
+	          // pass extents if the extent was not explicitly initialized
 	          vk_backend_i.get_swapchains_infos(
 	              backend,
 	              frameIndex,
@@ -1196,6 +1221,7 @@ static void rendergraph_execute( le_rendergraph_o* self, size_t frameIndex, le_b
 		pass->has_commands = !pass->executeCallbacks.empty();
 
 		if ( !pass->has_commands || !pass->is_contributing ) {
+			renderpass_run_cleanup_callback( pass );
 			continue;
 		}
 
@@ -1240,6 +1266,9 @@ static void rendergraph_execute( le_rendergraph_o* self, size_t frameIndex, le_b
 			// setup encoder default viewport and scissor to extent
 			encoder_graphics_i.set_scissor( encoder, 0, 1, default_scissor );
 			encoder_graphics_i.set_viewport( encoder, 0, 1, default_viewport );
+
+			// set default line width, as line width is dynamic
+			encoder_graphics_i.set_line_width( encoder, 1.f );
 		}
 
 		renderpass_run_execute_callbacks( pass, encoder ); // record draw commands into encoder
@@ -1249,6 +1278,7 @@ static void rendergraph_execute( le_rendergraph_o* self, size_t frameIndex, le_b
 		//
 		encoder_i.destroy( encoder );
 		encoder = nullptr;
+		renderpass_run_cleanup_callback( pass );
 	}
 
 	// TODO: consolidate pipeline caches
@@ -1353,6 +1383,16 @@ static void rendergraph_declare_resource( le_rendergraph_o* self, le_resource_ha
 }
 
 // ----------------------------------------------------------------------
+static le_renderpass_o* rendergraph_get_last_renderpass( le_rendergraph_o* self ) {
+	if ( self->passes.empty() ) {
+		return nullptr;
+	}
+
+	// ----------| invariant: passes is not empty
+	return self->passes.back();
+}
+
+// ----------------------------------------------------------------------
 static void rendergraph_add_on_frame_clear_callbacks( le_rendergraph_o* self, le_on_frame_clear_callback_data_t* callbacks, uint32_t callbacks_count ) {
 	self->on_frame_clear_callbacks.insert( self->on_frame_clear_callbacks.end(), callbacks, callbacks + callbacks_count );
 }
@@ -1370,6 +1410,7 @@ void register_le_rendergraph_api( void* api_ ) {
 	le_rendergraph_i.add_renderpass               = rendergraph_add_renderpass;
 	le_rendergraph_i.group_pass_with              = rendergraph_group_pass_with;
 	le_rendergraph_i.declare_resource             = rendergraph_declare_resource;
+	le_rendergraph_i.get_last_renderpass          = rendergraph_get_last_renderpass;
 	le_rendergraph_i.add_on_frame_clear_callbacks = rendergraph_add_on_frame_clear_callbacks;
 
 	auto& le_rendergraph_private_i                = le_renderer_api_i->le_rendergraph_private_i;
@@ -1389,11 +1430,13 @@ void register_le_rendergraph_api( void* api_ ) {
 	le_renderpass_i.get_queue_sumbission_info    = renderpass_get_queue_submission_info;
 	le_renderpass_i.get_framebuffer_settings     = renderpass_get_framebuffer_settings;
 	le_renderpass_i.set_width                    = renderpass_set_width;
-	le_renderpass_i.set_sample_count             = renderpass_set_sample_count;
+	le_renderpass_i.set_sample_count                          = renderpass_set_sample_count;
 	le_renderpass_i.set_height                   = renderpass_set_height;
-	le_renderpass_i.set_setup_callback           = renderpass_set_setup_callback;
+	le_renderpass_i.set_setup_callback                        = renderpass_set_setup_callback;
+	le_renderpass_i.set_cleanup_callback                      = renderpass_set_cleanup_callback;
 	le_renderpass_i.has_setup_callback           = renderpass_has_setup_callback;
-	le_renderpass_i.set_execute_callback         = renderpass_set_execute_callback;
+	le_renderpass_i.set_execute_callback                      = renderpass_set_execute_callback;
+	le_renderpass_i.set_execute_callback_with_local_user_data = renderpass_set_execute_callback_with_local_user_data;
 	le_renderpass_i.has_execute_callback         = renderpass_has_execute_callback;
 	le_renderpass_i.set_is_root                  = renderpass_set_is_root;
 	le_renderpass_i.get_is_root                  = renderpass_get_is_root;

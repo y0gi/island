@@ -178,6 +178,10 @@ class ImageAttachmentInfoBuilder {
 	BUILDER_IMPLEMENT( ImageAttachmentInfoBuilder, setColorClearValue, le::ClearValue, clearValue, = le_image_attachment_info_t::DefaultClearValueColor )
 	BUILDER_IMPLEMENT( ImageAttachmentInfoBuilder, setDepthStencilClearValue, le::ClearValue, clearValue, = le_image_attachment_info_t::DefaultClearValueDepthStencil )
 
+	/// setViewMask allows you to use MultiView Rendering - if viewMask is not 0, multiview rendering is on
+	/// viewMask bitfield controls which layers are being rendered into.
+	BUILDER_IMPLEMENT( ImageAttachmentInfoBuilder, setViewMask, uint32_t, viewMask, = 0 )
+
 	operator le_image_attachment_info_t const&() {
 		return self;
 	}
@@ -412,6 +416,27 @@ class RenderPass {
 		return *this;
 	}
 
+	template <typename T>
+	RenderPass& setExecuteCallbackWithLocalUserData( T& user_data_ref, le_renderer_api::pfn_renderpass_execute_t fun ) {
+		le_renderer::renderpass_i.set_execute_callback_with_local_user_data( self, &user_data_ref, sizeof( T ), fun );
+		return *this;
+	}
+
+	RenderPass& setExecuteCallbackWithLocalUserData( void* user_data, size_t user_data_num_bytes, le_renderer_api::pfn_renderpass_execute_t fun ) {
+		le_renderer::renderpass_i.set_execute_callback_with_local_user_data( self, user_data, user_data_num_bytes, fun );
+		return *this;
+	}
+
+	/// \brief   Cleanup gets executed after the renderpass exec callback has executed.
+	/// \details In case the renderpass does not contribute, it gets executed instead of executing the renderpass.
+	/// Cleanup is useful for ref tracking of objects that you refer to within the rendergraph -
+	/// if you increase their count before you add them to the rendergraph, and
+	/// decrease their count in cleanup, you can enforce that they are alife while the rendergraph is in-flight.
+	RenderPass& setCleanupCallback( void* user_data, le_renderer_api::pfn_renderpass_cleanup_t fun ) {
+		le_renderer::renderpass_i.set_cleanup_callback( self, user_data, fun );
+		return *this;
+	}
+
 	// ----
 
 	/// \brief Adds a resource as an image attachment to the renderpass.
@@ -481,6 +506,12 @@ class RenderPass {
 		return sampleTexture( textureName, le::ImageSamplerInfoBuilder( img_handle ).build() );
 	}
 
+	RenderPass& setExtent( uint32_t width, uint32_t height ) {
+		le_renderer::renderpass_i.set_width( self, width );
+		le_renderer::renderpass_i.set_height( self, height );
+		return *this;
+	}
+
 	RenderPass& setWidth( uint32_t width ) {
 		le_renderer::renderpass_i.set_width( self, width );
 		return *this;
@@ -495,6 +526,7 @@ class RenderPass {
 		le_renderer::renderpass_i.set_sample_count( self, sampleCount );
 		return *this;
 	}
+
 };
 
 // ----------------------------------------------------------------------
@@ -538,6 +570,13 @@ class RenderGraph : NoCopy, NoMove {
 	RenderGraph& declareResource( le_resource_handle const& resource_id, le_resource_info_t const& info ) {
 		le_renderer::rendergraph_i.declare_resource( self, resource_id, info );
 		return *this;
+	}
+
+	// Return last renderpass that was added to the rendergraph; nullptr if no renderpasses in the rendergraph.
+	// This is useful if you want to add something to the last renderpass, but don't directly have access to it.
+	// like when you blit an image and want to draw imgui at the same time.
+	le_renderpass_o* get_last_renderpass() {
+		return le_renderer::rendergraph_i.get_last_renderpass( self );
 	}
 };
 
@@ -662,6 +701,16 @@ class GraphicsEncoder {
 		return le_renderer::encoder_graphics_i.get_pipeline_manager( self );
 	}
 
+	GraphicsEncoder& insertDebugMessage( char const message[] = "", uint32_t priority = 3 ) {
+		size_t num_bytes = 0;
+		// count chars that are not null
+		for ( auto m = message; *m != '\0'; m++ ) {
+			num_bytes++;
+		};
+		le_renderer::encoder_i.insert_debug_message( self, message, num_bytes, priority );
+		return *this;
+	}
+
 	GraphicsEncoder& setPushConstantData( void const* data, uint64_t const& numBytes ) {
 		le_renderer::encoder_graphics_i.set_push_constant_data( self, data, numBytes );
 		return *this;
@@ -744,6 +793,7 @@ class GraphicsEncoder {
 		return *this;
 	}
 
+	[[deprecated( "Dynamic LineWidth should not be used" )]]
 	GraphicsEncoder& setLineWidth( float const& lineWidth ) {
 		le_renderer::encoder_graphics_i.set_line_width( self, lineWidth );
 		return *this;
@@ -759,14 +809,14 @@ class GraphicsEncoder {
 		return *this;
 	}
 
-	GraphicsEncoder& bindIndexBuffer( le_buffer_resource_handle const& bufferId, uint64_t const& offset, IndexType const& indexType = IndexType::eUint16 ) {
+	GraphicsEncoder& bindIndexBuffer( le_buffer_resource_handle const& bufferId, uint64_t const& offset = 0, IndexType const& indexType = IndexType::eUint16 ) {
 		le_renderer::encoder_graphics_i.bind_index_buffer( self, bufferId, offset, indexType );
 		return *this;
 	}
 
 	/// \param firstBinding: first binding index
-	/// \param pOffsets: byte offset per-binding. consider initialising this with a stack-allocated array as in `uint64_t offsets[] = {0};`
-	GraphicsEncoder& bindVertexBuffers( uint32_t const& firstBinding, uint32_t const& bindingCount, le_buffer_resource_handle const* pBufferId, uint64_t const* pOffsets ) {
+	/// \param pOffsets: (optional) byte offset per-binding. All zero if set to nullptr.
+	GraphicsEncoder& bindVertexBuffers( uint32_t const& firstBinding, uint32_t const& bindingCount, le_buffer_resource_handle const* pBufferId, uint64_t const* pOffsets = nullptr ) {
 		le_renderer::encoder_graphics_i.bind_vertex_buffers( self, firstBinding, bindingCount, pBufferId, pOffsets );
 		return *this;
 	}
@@ -818,6 +868,11 @@ class ComputeEncoder {
 
 	le_pipeline_manager_o* getPipelineManager() {
 		return le_renderer::encoder_compute_i.get_pipeline_manager( self );
+	}
+
+	ComputeEncoder& insertDebugMessage( char const* message, uint64_t const& numBytes, uint32_t priority ) {
+		le_renderer::encoder_i.insert_debug_message( self, message, numBytes, priority );
+		return *this;
 	}
 
 	ComputeEncoder& bindComputePipeline( le_cpso_handle pipelineHandle ) {
@@ -913,6 +968,11 @@ class TransferEncoder {
 		return self;
 	}
 
+	TransferEncoder& insertDebugMessage( char const* message, uint64_t const& numBytes, uint32_t priority ) {
+		le_renderer::encoder_i.insert_debug_message( self, message, numBytes, priority );
+		return *this;
+	}
+
 	TransferEncoder& copyToBuffer( le_buffer_resource_handle const& dst_buffer, size_t const& byte_offset_dst, le_buffer_resource_handle const& src_buffer, size_t const& byte_offset_src, size_t const& numBytes ) {
 		le_renderer::encoder_transfer_i.copy_to_buffer( self, dst_buffer, byte_offset_dst, src_buffer, byte_offset_src, numBytes );
 		return *this;
@@ -969,6 +1029,11 @@ class RtxEncoder {
 
 	operator auto() {
 		return self;
+	}
+
+	RtxEncoder& insertDebugMessage( char const* message, uint64_t const& numBytes, uint32_t priority ) {
+		le_renderer::encoder_i.insert_debug_message( self, message, numBytes, priority );
+		return *this;
 	}
 
 	RtxEncoder& setArgumentTlas( uint64_t const& argumentName, le_tlas_resource_handle const& tlasId, uint64_t const& arrayIndex = 0 ) {
